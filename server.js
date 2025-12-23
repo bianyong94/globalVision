@@ -361,34 +361,101 @@ app.post("/api/auth/login", async (req, res) => {
   }
 })
 
-app.get("/api/user/history", async (req, res) => {
-  const { username } = req.query
-  try {
-    const user = await User.findOne({ username })
-    success(res, user ? user.history : [])
-  } catch (e) {
-    success(res, [])
-  }
-})
-
+// [POST] 保存历史记录 (修复版)
 app.post("/api/user/history", async (req, res) => {
-  const { username, video } = req.body
-  if (!username || !video) return fail(res, "参数错误", 400)
+  const { username, video, episodeIndex, progress } = req.body;
+  if (!username || !video) return fail(res, "参数错误", 400);
+
   try {
-    const user = await User.findOne({ username })
-    if (!user) return fail(res, "用户不存在", 404)
-    let newHistory = (user.history || []).filter(
-      (h) => String(h.id) !== String(video.id)
-    )
-    newHistory.unshift({ ...video, viewedAt: new Date() })
-    user.history = newHistory.slice(0, 50)
-    user.markModified("history")
-    await user.save()
-    success(res, "ok")
+    const user = await User.findOne({ username });
+    if (!user) return fail(res, "用户不存在", 404);
+
+    // 强制转换为 String 进行对比，防止 类型不一致 导致去重失败
+    const targetId = String(video.id);
+
+    const historyItem = {
+      ...video,
+      id: targetId, // 存进去时强制转字符串
+      episodeIndex: parseInt(episodeIndex) || 0,
+      progress: parseFloat(progress) || 0,
+      viewedAt: new Date().toISOString()
+    };
+
+    // 过滤旧记录
+    let newHistory = (user.history || []).filter(h => String(h.id) !== targetId);
+    
+    // 插入新记录
+    newHistory.unshift(historyItem);
+    
+    // 限制长度
+    user.history = newHistory.slice(0, 50);
+    
+    // 标记修改并保存
+    user.markModified("history");
+    await user.save();
+
+    success(res, user.history);
   } catch (e) {
-    fail(res, "保存失败")
+    console.error("Save History Error:", e);
+    fail(res, "保存失败");
   }
-})
+});
+
+// [GET] 获取历史记录 (确保存在)
+app.get("/api/user/history", async (req, res) => {
+  const { username } = req.query;
+  try {
+    const user = await User.findOne({ username });
+    // 如果用户没记录，返回空数组，别报错
+    success(res, user ? user.history : []);
+  } catch (e) {
+    console.error("Get History Error:", e);
+    success(res, []); // 失败降级为空，防止前端崩
+  }
+});
+// ai问答相关
+const AI_API_KEY = "sk-czcljpvoexrvtwxosslbykvtwyjfiihkjksdgzafkwvovpxg"; // 填入你的 Key
+const AI_API_URL = "https://api.siliconflow.cn/v1/chat/completions"; // 硅基流动地址
+
+app.post("/api/ai/ask", async (req, res) => {
+  const { question } = req.body;
+  if (!question) return fail(res, "请输入问题", 400);
+
+  try {
+    const response = await axios.post(
+      AI_API_URL,
+      {
+        model: "Qwen/Qwen2.5-7B-Instruct", // 或者 "Qwen/Qwen2.5-7B-Instruct"
+        messages: [
+          {
+            role: "system",
+            content: "你是一个影视百科专家。用户会描述剧情、演员或模糊的记忆，请你推测用户想找的电影或电视剧。请直接返回 3 到 6 个最可能的影视名称，名称之间用英文逗号分隔。不要返回任何其他解释性文字、标点或前缀。例如返回：'肖申克的救赎,阿甘正传,霸王别姬'",
+          },
+          { role: "user", content: question },
+        ],
+        stream: false,
+        max_tokens: 100,
+        temperature: 0.7,
+      },
+      {
+        headers: {
+          "Authorization": `Bearer ${AI_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        timeout: 15000, // AI 有时较慢
+      }
+    );
+
+    const content = response.data.choices[0].message.content;
+    // 清洗数据：去掉可能的句号、换行，分割成数组
+    const recommendations = content.replace(/。/g, '').split(/,|，|\n/).map(s => s.trim()).filter(s => s);
+
+    success(res, recommendations);
+  } catch (error) {
+    console.error("AI Error:", error.response?.data || error.message);
+    fail(res, "AI 暂时累了，请稍后再试");
+  }
+});
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 Server running on port ${PORT}`)
