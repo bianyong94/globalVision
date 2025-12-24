@@ -1,4 +1,4 @@
-// server.js - 终极版 (并发竞速 + 熔断 + 演员搜索支持)
+// server.js - 生产级终极版
 require("dotenv").config()
 const express = require("express")
 const axios = require("axios")
@@ -7,6 +7,8 @@ const NodeCache = require("node-cache")
 const mongoose = require("mongoose")
 const http = require("http")
 const https = require("https")
+const compression = require("compression") // ✨ 新增：Gzip压缩
+const rateLimit = require("express-rate-limit") // ✨ 新增：速率限制
 const { HttpsProxyAgent } = require("https-proxy-agent")
 
 // 引入源配置
@@ -17,42 +19,77 @@ const PORT = process.env.PORT || 3000
 const cache = new NodeCache({ stdTTL: 600, checkperiod: 120 })
 
 // ==========================================
-// 1. 基础设施 (HTTP代理/连接池/数据库)
+// 0. 安全与性能中间件 (新增)
 // ==========================================
 
-// 启用 Keep-Alive 复用连接，显著减少 SSL 握手延迟
+// 1. 开启 Gzip 压缩 (大幅减小 JSON 体积)
+app.use(compression())
+
+// 2. 限制请求频率 (防止恶意刷接口/爆破 AI Key)
+const limiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1分钟窗口
+  max: 100, // 每个IP限制 100 次请求
+  message: { code: 429, message: "请求过于频繁，请稍后再试" },
+  standardHeaders: true,
+  legacyHeaders: false,
+})
+app.use("/api/", limiter) // 仅对 API 路由生效
+
+// 3. 严格的 AI 接口限流 (AI 接口很贵)
+const aiLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 10, // 每分钟只能问 10 次
+  message: { code: 429, message: "AI 思考过于频繁，请休息一下" },
+})
+
+// 4. CORS 配置 (建议上线后限制域名)
+// 本地开发允许所有，生产环境建议指定域名
+const corsOptions = {
+  origin:
+    process.env.NODE_ENV === "production"
+      ? [process.env.FRONTEND_URL, "https://maizi93.zeabur.app"] // 替换为你的前端域名
+      : "*",
+  optionsSuccessStatus: 200,
+}
+app.use(cors(corsOptions))
+app.use(express.json())
+
+// ==========================================
+// 1. 基础设施
+// ==========================================
+
 const httpAgent = new http.Agent({ keepAlive: true })
 const httpsAgent = new https.Agent({
   keepAlive: true,
   rejectUnauthorized: false,
 })
 
-// MongoDB 连接
 const MONGO_URI = process.env.MONGO_URI
 if (MONGO_URI) {
   mongoose
     .connect(MONGO_URI)
     .then(() => console.log("✅ MongoDB Connected"))
     .catch((err) => console.error("❌ MongoDB Connection Error:", err))
+} else {
+  console.warn("⚠️ 警告: 未配置 MONGO_URI，用户功能将无法使用")
 }
 
-// User 模型
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   history: { type: Array, default: [] },
+  // ✨ 新增：收藏夹字段
+  favorites: { type: Array, default: [] },
   createdAt: { type: Date, default: Date.now },
 })
+// 添加索引优化查询
+UserSchema.index({ username: 1 })
 const User = mongoose.model("User", UserSchema)
 
-app.use(cors())
-app.use(express.json())
-
 // ==========================================
-// 2. 智能调度核心 (熔断与并发)
+// 2. 智能调度核心
 // ==========================================
 
-// 熔断状态存储
 const sourceHealth = {}
 PRIORITY_LIST.forEach((key) => {
   sourceHealth[key] = { failCount: 0, deadUntil: 0 }
@@ -62,7 +99,7 @@ const markSourceFailed = (key) => {
   const health = sourceHealth[key]
   health.failCount++
   if (health.failCount >= 3) {
-    health.deadUntil = Date.now() + 5 * 60 * 1000 // 3次失败 -> 封禁5分钟
+    health.deadUntil = Date.now() + 5 * 60 * 1000
     console.warn(`🔥 [熔断] 源 ${key} 暂停使用 5分钟`)
   } else if (health.failCount >= 2) {
     health.deadUntil = Date.now() + 30 * 1000
@@ -76,10 +113,9 @@ const markSourceSuccess = (key) => {
   }
 }
 
-// 获取请求配置
 const getAxiosConfig = () => {
   const config = {
-    timeout: 5000, // 5秒超时
+    timeout: 5000,
     httpAgent,
     httpsAgent,
     proxy: false,
@@ -89,23 +125,18 @@ const getAxiosConfig = () => {
   return config
 }
 
-/**
- * 🚀 智能并发请求
- * 同时请求多个健康的源，谁先回来用谁的数据 (Promise.any)
- */
 const smartFetch = async (paramsFn, specificSourceKey = null) => {
   let targetKeys = []
 
   if (specificSourceKey) {
-    targetKeys = [specificSourceKey] // 详情页指定源
+    targetKeys = [specificSourceKey]
   } else {
-    // 列表页：过滤掉熔断的源，取前3个健康源竞速
     targetKeys = PRIORITY_LIST.filter(
       (key) => sourceHealth[key].deadUntil <= Date.now()
     ).slice(0, 3)
   }
 
-  if (targetKeys.length === 0) targetKeys = [PRIORITY_LIST[0]] // 兜底
+  if (targetKeys.length === 0) targetKeys = [PRIORITY_LIST[0]]
 
   const requests = targetKeys.map(async (key) => {
     const source = sources[key]
@@ -146,7 +177,7 @@ const smartFetch = async (paramsFn, specificSourceKey = null) => {
 }
 
 // ==========================================
-// 3. 数据清洗 (包含演员字段支持)
+// 3. 数据处理
 // ==========================================
 
 const success = (res, data) => res.json({ code: 200, message: "success", data })
@@ -157,7 +188,7 @@ const processVideoList = (list, sourceKey, limit = 12) => {
   if (!list || !Array.isArray(list)) return []
 
   const processed = list.map((item) => ({
-    id: `${sourceKey}$${item.vod_id}`, // ID 绑定源
+    id: `${sourceKey}$${item.vod_id}`,
     title: item.vod_name,
     type: item.type_name,
     poster: item.vod_pic,
@@ -165,14 +196,10 @@ const processVideoList = (list, sourceKey, limit = 12) => {
     year: parseInt(item.vod_year) || 0,
     rating: parseFloat(item.vod_score) || 0.0,
     date: item.vod_time,
-
-    // ✨ 新增：支持演员和导演搜索展示
-    // 前端 VideoCard 可以显示 "主演: xxx"
     actors: item.vod_actor || "",
     director: item.vod_director || "",
   }))
 
-  // 排序：优先年份新 > 评分高
   processed.sort((a, b) => {
     if (a.year !== b.year) return b.year - a.year
     return b.rating - a.rating
@@ -185,70 +212,83 @@ const processVideoList = (list, sourceKey, limit = 12) => {
 // 4. API 路由
 // ==========================================
 
-// [首页聚合]
+// [首页]
 app.get("/api/home/trending", async (req, res) => {
-  const cacheKey = "home_dashboard_v2"
+  const cacheKey = "home_dashboard_v4" // 再次升级缓存版本，强制刷新
   if (cache.has(cacheKey)) return success(res, cache.get(cacheKey))
 
   try {
     const createFetcher = (typeFunc) =>
-      smartFetch((s) => ({
-        ac: "detail",
-        at: "json",
-        pg: 1,
-        ...typeFunc(s),
-      }))
+      smartFetch((s) => ({ ac: "detail", at: "json", pg: 1, ...typeFunc(s) }))
 
-    // 并发获取四大板块
-    const [latest, movies, tvs, animes] = await Promise.allSettled([
-      smartFetch(() => ({ ac: "detail", at: "json", pg: 1, h: 24 })),
-      createFetcher((s) => ({ t: s.home_map.movie_hot })),
-      createFetcher((s) => ({ t: s.home_map.tv_cn })),
-      createFetcher((s) => ({ t: s.home_map.anime })),
+    // ✨ 修改点 1: 去掉 h: 24，改为直接获取最新 (pg: 1)，保证有数据
+    const taskLatest = smartFetch(() => ({ ac: "detail", at: "json", pg: 1 }))
+    const taskMovies = createFetcher((s) => ({ t: s.home_map.movie_hot }))
+    const taskTvs = createFetcher((s) => ({ t: s.home_map.tv_cn }))
+    const taskAnimes = createFetcher((s) => ({ t: s.home_map.anime }))
+
+    const results = await Promise.allSettled([
+      taskLatest,
+      taskMovies,
+      taskTvs,
+      taskAnimes,
     ])
 
-    const extract = (r, limit) =>
-      r.status === "fulfilled"
-        ? processVideoList(r.value.data.list, r.value.sourceKey, limit)
-        : []
-
-    const data = {
-      banners: extract(latest, 5),
-      movies: extract(movies, 12),
-      tvs: extract(tvs, 12),
-      animes: extract(animes, 12),
+    // ✨ 修改点 2: 增加调试日志，看看到底哪一步空了
+    const logStatus = (name, result) => {
+      if (result.status === "rejected") {
+        console.warn(`⚠️ [首页] ${name} 请求失败:`, result.reason.message)
+        return []
+      }
+      const list = result.value.data.list
+      if (!list || list.length === 0) {
+        console.warn(
+          `⚠️ [首页] ${name} 返回了空数组 (可能是分类ID t值 配置错误)`
+        )
+        return []
+      }
+      return processVideoList(list, result.value.sourceKey, 12)
     }
 
+    const data = {
+      banners: processVideoList(
+        results[0].status === "fulfilled" ? results[0].value.data.list : [],
+        results[0].status === "fulfilled" ? results[0].value.sourceKey : null,
+        5
+      ),
+      movies: logStatus("电影", results[1]),
+      tvs: logStatus("剧集", results[2]),
+      animes: logStatus("动漫", results[3]),
+    }
+
+    // 只要有一个板块有数据，就算成功
     cache.set(cacheKey, data)
     success(res, data)
   } catch (e) {
-    console.error(e)
+    console.error("Home Fatal Error:", e)
     fail(res, "首页服务繁忙")
   }
 })
-
-// [搜索/列表]
+// [搜索]
 app.get("/api/videos", async (req, res) => {
   const { t, pg, wd, h, year, by } = req.query
 
   try {
     const result = await smartFetch((source) => {
-      // ⚠️ 关键：wd (keywords) 会被标准 CMS 接口用于匹配 标题、演员、导演
       const params = { ac: "detail", at: "json", pg: pg || 1 }
-
       if (t) params.t = source.id_map && source.id_map[t] ? source.id_map[t] : t
       if (wd) params.wd = wd
       if (h) params.h = h
-
       return params
     })
 
     let list = processVideoList(result.data.list, result.sourceKey, 100)
-
-    // 二次过滤 (有些源接口不支持年份筛选，需手动过滤)
     if (year && year !== "全部") {
       list = list.filter((v) => v.year == year)
     }
+
+    // ✨ 简单的排序支持
+    if (by === "score") list.sort((a, b) => b.rating - a.rating)
 
     success(res, {
       list,
@@ -256,7 +296,7 @@ app.get("/api/videos", async (req, res) => {
       source: result.sourceName,
     })
   } catch (e) {
-    success(res, { list: [] }) // 搜不到返回空，不报错
+    success(res, { list: [] })
   }
 })
 
@@ -274,22 +314,16 @@ app.get("/api/detail/:id", async (req, res) => {
 
   try {
     const result = await smartFetch(
-      () => ({
-        ac: "detail",
-        at: "json",
-        ids: vodId,
-      }),
+      () => ({ ac: "detail", at: "json", ids: vodId }),
       sourceKey
     )
 
     const detail = result.data.list[0]
-
-    // 播放地址解析
     const parseEpisodes = (urlStr, fromStr) => {
       if (!urlStr) return []
       const froms = (fromStr || "").split("$$$")
       const urls = urlStr.split("$$$")
-      // 优先 m3u8
+      // 优先 m3u8，找不到则回退
       let idx = froms.findIndex((f) => f.toLowerCase().includes("m3u8"))
       if (idx === -1) idx = 0
 
@@ -309,7 +343,7 @@ app.get("/api/detail/:id", async (req, res) => {
       area: detail.vod_area,
       year: detail.vod_year,
       director: detail.vod_director,
-      actors: detail.vod_actor, // 详情页当然也要有演员
+      actors: detail.vod_actor,
       remarks: detail.vod_remarks,
       rating: detail.vod_score,
       episodes: parseEpisodes(detail.vod_play_url, detail.vod_play_from),
@@ -327,7 +361,7 @@ app.get("/api/categories", async (req, res) => {
     const result = await smartFetch(() => ({ ac: "list", at: "json" }))
     const rawClass = result.data.class || []
     const safeClass = rawClass.filter(
-      (c) => !["伦理", "福利"].includes(c.type_name)
+      (c) => !["伦理", "福利", "激情", "论理"].includes(c.type_name)
     )
     cache.set(cacheKey, safeClass, 86400)
     success(res, safeClass)
@@ -336,12 +370,13 @@ app.get("/api/categories", async (req, res) => {
   }
 })
 
-// [Auth] 保持不变...
+// [Auth]
 app.post("/api/auth/register", async (req, res) => {
   const { username, password } = req.body
   try {
     const existing = await User.findOne({ username })
     if (existing) return fail(res, "用户已存在", 400)
+    // ⚠️ 生产环境建议这里加 bcrypt 加密
     const newUser = new User({ username, password })
     await newUser.save()
     success(res, { id: newUser._id, username })
@@ -361,75 +396,73 @@ app.post("/api/auth/login", async (req, res) => {
   }
 })
 
-// [POST] 保存历史记录 (修复版)
+// [History]
+app.get("/api/user/history", async (req, res) => {
+  const { username } = req.query
+  if (!username) return success(res, [])
+  try {
+    const user = await User.findOne({ username })
+    success(res, user ? user.history : [])
+  } catch (e) {
+    console.error(e)
+    success(res, [])
+  }
+})
+
 app.post("/api/user/history", async (req, res) => {
-  const { username, video, episodeIndex, progress } = req.body;
-  if (!username || !video) return fail(res, "参数错误", 400);
+  const { username, video, episodeIndex, progress } = req.body
+  if (!username || !video) return fail(res, "参数错误", 400)
 
   try {
-    const user = await User.findOne({ username });
-    if (!user) return fail(res, "用户不存在", 404);
+    const user = await User.findOne({ username })
+    if (!user) return fail(res, "用户不存在", 404)
 
-    // 强制转换为 String 进行对比，防止 类型不一致 导致去重失败
-    const targetId = String(video.id);
-
+    const targetId = String(video.id)
     const historyItem = {
       ...video,
-      id: targetId, // 存进去时强制转字符串
+      id: targetId,
       episodeIndex: parseInt(episodeIndex) || 0,
       progress: parseFloat(progress) || 0,
-      viewedAt: new Date().toISOString()
-    };
+      viewedAt: new Date().toISOString(),
+    }
 
-    // 过滤旧记录
-    let newHistory = (user.history || []).filter(h => String(h.id) !== targetId);
-    
-    // 插入新记录
-    newHistory.unshift(historyItem);
-    
-    // 限制长度
-    user.history = newHistory.slice(0, 50);
-    
-    // 标记修改并保存
-    user.markModified("history");
-    await user.save();
+    let newHistory = (user.history || []).filter(
+      (h) => String(h.id) !== targetId
+    )
+    newHistory.unshift(historyItem)
+    user.history = newHistory.slice(0, 50)
 
-    success(res, user.history);
+    user.markModified("history")
+    await user.save()
+    success(res, user.history)
   } catch (e) {
-    console.error("Save History Error:", e);
-    fail(res, "保存失败");
+    console.error("History Save Error", e)
+    fail(res, "保存失败")
   }
-});
+})
 
-// [GET] 获取历史记录 (确保存在)
-app.get("/api/user/history", async (req, res) => {
-  const { username } = req.query;
-  try {
-    const user = await User.findOne({ username });
-    // 如果用户没记录，返回空数组，别报错
-    success(res, user ? user.history : []);
-  } catch (e) {
-    console.error("Get History Error:", e);
-    success(res, []); // 失败降级为空，防止前端崩
-  }
-});
-// ai问答相关
-const AI_API_KEY = "sk-czcljpvoexrvtwxosslbykvtwyjfiihkjksdgzafkwvovpxg"; // 填入你的 Key
-const AI_API_URL = "https://api.siliconflow.cn/v1/chat/completions"; // 硅基流动地址
+// [AI Search]
+// ✨ 关键修正：从环境变量读取 Key
+const AI_API_KEY = process.env.AI_API_KEY
+const AI_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 
-app.post("/api/ai/ask", async (req, res) => {
-  const { question } = req.body;
-  if (!question) return fail(res, "请输入问题", 400);
+app.post("/api/ai/ask", aiLimiter, async (req, res) => {
+  // 应用 AI 限流
+  const { question } = req.body
+
+  if (!AI_API_KEY) return fail(res, "服务端未配置 AI Key", 500)
+  if (!question) return fail(res, "请输入问题", 400)
 
   try {
     const response = await axios.post(
       AI_API_URL,
       {
-        model: "Qwen/Qwen2.5-7B-Instruct", // 或者 "Qwen/Qwen2.5-7B-Instruct"
+        model: "Qwen/Qwen2.5-7B-Instruct",
         messages: [
           {
             role: "system",
-            content: "你是一个影视百科专家。用户会描述剧情、演员或模糊的记忆，请你推测用户想找的电影或电视剧。请直接返回 3 到 6 个最可能的影视名称，名称之间用英文逗号分隔。不要返回任何其他解释性文字、标点或前缀。例如返回：'肖申克的救赎,阿甘正传,霸王别姬'",
+            content:
+              "你是一个影视百科专家。请根据用户描述推测影视作品。直接返回 3-6 个最可能的名称，用英文逗号分隔。不要返回任何其他文字。例如：'阿甘正传,霸王别姬'",
           },
           { role: "user", content: question },
         ],
@@ -439,25 +472,33 @@ app.post("/api/ai/ask", async (req, res) => {
       },
       {
         headers: {
-          "Authorization": `Bearer ${AI_API_KEY}`,
+          Authorization: `Bearer ${AI_API_KEY}`,
           "Content-Type": "application/json",
         },
-        timeout: 15000, // AI 有时较慢
+        timeout: 10000,
       }
-    );
+    )
 
-    const content = response.data.choices[0].message.content;
-    // 清洗数据：去掉可能的句号、换行，分割成数组
-    const recommendations = content.replace(/。/g, '').split(/,|，|\n/).map(s => s.trim()).filter(s => s);
-
-    success(res, recommendations);
+    const content = response.data.choices[0].message.content
+    const recommendations = content
+      .replace(/。/g, "")
+      .split(/,|，|\n/)
+      .map((s) => s.trim())
+      .filter((s) => s)
+    success(res, recommendations)
   } catch (error) {
-    console.error("AI Error:", error.response?.data || error.message);
-    fail(res, "AI 暂时累了，请稍后再试");
+    console.error("AI Error:", error.response?.data || error.message)
+    fail(res, "AI 暂时繁忙")
   }
-});
+})
+
+// 全局错误捕获 (防止未知错误导致服务挂掉)
+app.use((err, req, res, next) => {
+  console.error("Global Error:", err)
+  res.status(500).json({ code: 500, message: "Server Internal Error" })
+})
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 Server running on port ${PORT}`)
-  console.log(`🛡️  Features: Concurrency / CircuitBreaker / ActorSearch`)
+  console.log(`🛡️  Mode: Production | RateLimit: ON | Gzip: ON`)
 })
