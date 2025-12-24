@@ -1,4 +1,4 @@
-// server.js - 生产级终极版
+// server.js - 终极版 (并发竞速 + 熔断 + 演员搜索 + Redis缓存)
 require("dotenv").config()
 const express = require("express")
 const axios = require("axios")
@@ -7,47 +7,92 @@ const NodeCache = require("node-cache")
 const mongoose = require("mongoose")
 const http = require("http")
 const https = require("https")
-const compression = require("compression") // ✨ 新增：Gzip压缩
-const rateLimit = require("express-rate-limit") // ✨ 新增：速率限制
+const compression = require("compression")
+const rateLimit = require("express-rate-limit")
 const { HttpsProxyAgent } = require("https-proxy-agent")
+const Redis = require("ioredis") // ✨ 新增：引入 Redis
 
 // 引入源配置
 const { sources, PRIORITY_LIST } = require("./config/sources")
 
 const app = express()
 const PORT = process.env.PORT || 3000
-const cache = new NodeCache({ stdTTL: 600, checkperiod: 120 })
 
 // ==========================================
-// 0. 安全与性能中间件 (新增)
+// 0. 缓存系统初始化 (Redis + 内存降级)
 // ==========================================
 
-// 1. 开启 Gzip 压缩 (大幅减小 JSON 体积)
+// 本地内存缓存 (作为 Redis 的兜底方案)
+const localCache = new NodeCache({ stdTTL: 600, checkperiod: 120 })
+let redisClient = null
+
+// 尝试连接 Redis (Zeabur 会自动注入 REDIS_CONNECTION_STRING)
+if (process.env.REDIS_CONNECTION_STRING) {
+  redisClient = new Redis(process.env.REDIS_CONNECTION_STRING)
+  redisClient.on("connect", () => console.log("✅ Redis Cache Connected"))
+  redisClient.on("error", (err) => {
+    console.error("❌ Redis Error (Falling back to memory):", err.message)
+    // 如果 Redis 挂了，可以在这里做降级逻辑，目前 ioredis 会自动重连
+  })
+} else {
+  console.log("⚠️ No Redis Config found, using Memory Cache")
+}
+
+// 📦 统一缓存封装函数 (核心)
+const getCache = async (key) => {
+  try {
+    if (redisClient) {
+      const data = await redisClient.get(key)
+      return data ? JSON.parse(data) : null
+    }
+    return localCache.get(key)
+  } catch (e) {
+    return null // 出错时不阻塞流程，视为无缓存
+  }
+}
+
+const setCache = async (key, data, ttlSeconds = 600) => {
+  try {
+    if (redisClient) {
+      // Redis SETEX: key, seconds, value
+      await redisClient.set(key, JSON.stringify(data), "EX", ttlSeconds)
+    } else {
+      localCache.set(key, data, ttlSeconds)
+    }
+  } catch (e) {
+    console.error("Set Cache Error:", e)
+  }
+}
+
+// ==========================================
+// 1. 安全与配置
+// ==========================================
+
 app.use(compression())
 
-// 2. 限制请求频率 (防止恶意刷接口/爆破 AI Key)
 const limiter = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1分钟窗口
-  max: 100, // 每个IP限制 100 次请求
-  message: { code: 429, message: "请求过于频繁，请稍后再试" },
+  windowMs: 1 * 60 * 1000,
+  max: 100,
+  message: { code: 429, message: "Too many requests" },
   standardHeaders: true,
   legacyHeaders: false,
 })
-app.use("/api/", limiter) // 仅对 API 路由生效
+app.use("/api/", limiter)
 
-// 3. 严格的 AI 接口限流 (AI 接口很贵)
 const aiLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
-  max: 10, // 每分钟只能问 10 次
-  message: { code: 429, message: "AI 思考过于频繁，请休息一下" },
+  max: 10,
+  message: { code: 429, message: "AI Busy" },
 })
 
-// 4. CORS 配置 (建议上线后限制域名)
-// 本地开发允许所有，生产环境建议指定域名
 const corsOptions = {
   origin:
     process.env.NODE_ENV === "production"
-      ? [process.env.FRONTEND_URL, "https://maizi93.zeabur.app"] // 替换为你的前端域名
+      ? [
+          process.env.FRONTEND_URL,
+          "https://maizi93.zeabur.app",
+          "https://global-vision-web.vercel.app",
+        ]
       : "*",
   optionsSuccessStatus: 200,
 }
@@ -55,7 +100,7 @@ app.use(cors(corsOptions))
 app.use(express.json())
 
 // ==========================================
-// 1. 基础设施
+// 2. 数据库与网络代理
 // ==========================================
 
 const httpAgent = new http.Agent({ keepAlive: true })
@@ -68,26 +113,22 @@ const MONGO_URI = process.env.MONGO_URI
 if (MONGO_URI) {
   mongoose
     .connect(MONGO_URI)
-    .then(() => console.log("✅ MongoDB Connected"))
+    .then(() => console.log("✅ MongoDB Database Connected"))
     .catch((err) => console.error("❌ MongoDB Connection Error:", err))
-} else {
-  console.warn("⚠️ 警告: 未配置 MONGO_URI，用户功能将无法使用")
 }
 
 const UserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   history: { type: Array, default: [] },
-  // ✨ 新增：收藏夹字段
   favorites: { type: Array, default: [] },
   createdAt: { type: Date, default: Date.now },
 })
-// 添加索引优化查询
 UserSchema.index({ username: 1 })
 const User = mongoose.model("User", UserSchema)
 
 // ==========================================
-// 2. 智能调度核心
+// 3. 智能调度 (熔断+竞速)
 // ==========================================
 
 const sourceHealth = {}
@@ -177,7 +218,7 @@ const smartFetch = async (paramsFn, specificSourceKey = null) => {
 }
 
 // ==========================================
-// 3. 数据处理
+// 4. 数据处理工具
 // ==========================================
 
 const success = (res, data) => res.json({ code: 200, message: "success", data })
@@ -209,19 +250,21 @@ const processVideoList = (list, sourceKey, limit = 12) => {
 }
 
 // ==========================================
-// 4. API 路由
+// 5. API 路由 (已集成 Redis)
 // ==========================================
 
-// [首页]
+// [首页] - 使用 Redis 缓存
 app.get("/api/home/trending", async (req, res) => {
-  const cacheKey = "home_dashboard_v4" // 再次升级缓存版本，强制刷新
-  if (cache.has(cacheKey)) return success(res, cache.get(cacheKey))
+  const cacheKey = "home_dashboard_v5" // 缓存 Key
+
+  // ✨ 1. 尝试从缓存取
+  const cachedData = await getCache(cacheKey)
+  if (cachedData) return success(res, cachedData)
 
   try {
     const createFetcher = (typeFunc) =>
       smartFetch((s) => ({ ac: "detail", at: "json", pg: 1, ...typeFunc(s) }))
 
-    // ✨ 修改点 1: 去掉 h: 24，改为直接获取最新 (pg: 1)，保证有数据
     const taskLatest = smartFetch(() => ({ ac: "detail", at: "json", pg: 1 }))
     const taskMovies = createFetcher((s) => ({ t: s.home_map.movie_hot }))
     const taskTvs = createFetcher((s) => ({ t: s.home_map.tv_cn }))
@@ -234,19 +277,13 @@ app.get("/api/home/trending", async (req, res) => {
       taskAnimes,
     ])
 
-    // ✨ 修改点 2: 增加调试日志，看看到底哪一步空了
     const logStatus = (name, result) => {
       if (result.status === "rejected") {
-        console.warn(`⚠️ [首页] ${name} 请求失败:`, result.reason.message)
+        console.warn(`⚠️ [首页] ${name} 失败:`, result.reason.message)
         return []
       }
       const list = result.value.data.list
-      if (!list || list.length === 0) {
-        console.warn(
-          `⚠️ [首页] ${name} 返回了空数组 (可能是分类ID t值 配置错误)`
-        )
-        return []
-      }
+      if (!list || list.length === 0) return []
       return processVideoList(list, result.value.sourceKey, 12)
     }
 
@@ -261,14 +298,16 @@ app.get("/api/home/trending", async (req, res) => {
       animes: logStatus("动漫", results[3]),
     }
 
-    // 只要有一个板块有数据，就算成功
-    cache.set(cacheKey, data)
+    // ✨ 2. 存入缓存 (10分钟)
+    await setCache(cacheKey, data, 600)
+
     success(res, data)
   } catch (e) {
-    console.error("Home Fatal Error:", e)
+    console.error("Home Error:", e)
     fail(res, "首页服务繁忙")
   }
 })
+
 // [搜索]
 app.get("/api/videos", async (req, res) => {
   const { t, pg, wd, h, year, by } = req.query
@@ -286,8 +325,6 @@ app.get("/api/videos", async (req, res) => {
     if (year && year !== "全部") {
       list = list.filter((v) => v.year == year)
     }
-
-    // ✨ 简单的排序支持
     if (by === "score") list.sort((a, b) => b.rating - a.rating)
 
     success(res, {
@@ -323,10 +360,8 @@ app.get("/api/detail/:id", async (req, res) => {
       if (!urlStr) return []
       const froms = (fromStr || "").split("$$$")
       const urls = urlStr.split("$$$")
-      // 优先 m3u8，找不到则回退
       let idx = froms.findIndex((f) => f.toLowerCase().includes("m3u8"))
       if (idx === -1) idx = 0
-
       const targetUrl = urls[idx] || urls[0]
       return targetUrl.split("#").map((ep) => {
         const [name, link] = ep.split("$")
@@ -353,30 +388,36 @@ app.get("/api/detail/:id", async (req, res) => {
   }
 })
 
-// [分类]
+// [分类] - 使用 Redis 缓存
 app.get("/api/categories", async (req, res) => {
-  const cacheKey = "categories"
-  if (cache.has(cacheKey)) return success(res, cache.get(cacheKey))
+  const cacheKey = "categories_list"
+
+  // ✨ 1. 尝试从缓存取
+  const cachedData = await getCache(cacheKey)
+  if (cachedData) return success(res, cachedData)
+
   try {
     const result = await smartFetch(() => ({ ac: "list", at: "json" }))
     const rawClass = result.data.class || []
     const safeClass = rawClass.filter(
       (c) => !["伦理", "福利", "激情", "论理"].includes(c.type_name)
     )
-    cache.set(cacheKey, safeClass, 86400)
+
+    // ✨ 2. 存入缓存 (24小时)
+    await setCache(cacheKey, safeClass, 86400)
+
     success(res, safeClass)
   } catch (e) {
     success(res, [])
   }
 })
 
-// [Auth]
+// [User & AI] 保持不变
 app.post("/api/auth/register", async (req, res) => {
   const { username, password } = req.body
   try {
     const existing = await User.findOne({ username })
     if (existing) return fail(res, "用户已存在", 400)
-    // ⚠️ 生产环境建议这里加 bcrypt 加密
     const newUser = new User({ username, password })
     await newUser.save()
     success(res, { id: newUser._id, username })
@@ -396,7 +437,6 @@ app.post("/api/auth/login", async (req, res) => {
   }
 })
 
-// [History]
 app.get("/api/user/history", async (req, res) => {
   const { username } = req.query
   if (!username) return success(res, [])
@@ -404,7 +444,6 @@ app.get("/api/user/history", async (req, res) => {
     const user = await User.findOne({ username })
     success(res, user ? user.history : [])
   } catch (e) {
-    console.error(e)
     success(res, [])
   }
 })
@@ -412,11 +451,9 @@ app.get("/api/user/history", async (req, res) => {
 app.post("/api/user/history", async (req, res) => {
   const { username, video, episodeIndex, progress } = req.body
   if (!username || !video) return fail(res, "参数错误", 400)
-
   try {
     const user = await User.findOne({ username })
     if (!user) return fail(res, "用户不存在", 404)
-
     const targetId = String(video.id)
     const historyItem = {
       ...video,
@@ -425,34 +462,26 @@ app.post("/api/user/history", async (req, res) => {
       progress: parseFloat(progress) || 0,
       viewedAt: new Date().toISOString(),
     }
-
     let newHistory = (user.history || []).filter(
       (h) => String(h.id) !== targetId
     )
     newHistory.unshift(historyItem)
     user.history = newHistory.slice(0, 50)
-
     user.markModified("history")
     await user.save()
     success(res, user.history)
   } catch (e) {
-    console.error("History Save Error", e)
     fail(res, "保存失败")
   }
 })
 
-// [AI Search]
-// ✨ 关键修正：从环境变量读取 Key
 const AI_API_KEY = process.env.AI_API_KEY
 const AI_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 
 app.post("/api/ai/ask", aiLimiter, async (req, res) => {
-  // 应用 AI 限流
   const { question } = req.body
-
   if (!AI_API_KEY) return fail(res, "服务端未配置 AI Key", 500)
   if (!question) return fail(res, "请输入问题", 400)
-
   try {
     const response = await axios.post(
       AI_API_URL,
@@ -462,7 +491,7 @@ app.post("/api/ai/ask", aiLimiter, async (req, res) => {
           {
             role: "system",
             content:
-              "你是一个影视百科专家。请根据用户描述推测影视作品。直接返回 3-6 个最可能的名称，用英文逗号分隔。不要返回任何其他文字。例如：'阿甘正传,霸王别姬'",
+              "你是一个影视百科专家。请根据用户描述推测影视作品。直接返回 3-6 个最可能的名称，用英文逗号分隔。",
           },
           { role: "user", content: question },
         ],
@@ -478,7 +507,6 @@ app.post("/api/ai/ask", aiLimiter, async (req, res) => {
         timeout: 10000,
       }
     )
-
     const content = response.data.choices[0].message.content
     const recommendations = content
       .replace(/。/g, "")
@@ -487,12 +515,10 @@ app.post("/api/ai/ask", aiLimiter, async (req, res) => {
       .filter((s) => s)
     success(res, recommendations)
   } catch (error) {
-    console.error("AI Error:", error.response?.data || error.message)
     fail(res, "AI 暂时繁忙")
   }
 })
 
-// 全局错误捕获 (防止未知错误导致服务挂掉)
 app.use((err, req, res, next) => {
   console.error("Global Error:", err)
   res.status(500).json({ code: 500, message: "Server Internal Error" })
@@ -500,5 +526,5 @@ app.use((err, req, res, next) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n🚀 Server running on port ${PORT}`)
-  console.log(`🛡️  Mode: Production | RateLimit: ON | Gzip: ON`)
+  console.log(`🛡️  Mode: Production | RateLimit: ON | Redis: Supported`)
 })
