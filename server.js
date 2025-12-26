@@ -255,61 +255,80 @@ const processVideoList = (list, sourceKey, limit = 12) => {
 // 5. API 路由 (已集成 Redis)
 // ==========================================
 
-// [首页] - 使用 Redis 缓存
+// [首页聚合] - 修复版 (包含综艺、纪录片、ID自动映射)
 app.get("/api/home/trending", async (req, res) => {
-  const cacheKey = "home_dashboard_v5" // 缓存 Key
-
-  // ✨ 1. 尝试从缓存取
+  const cacheKey = "home_dashboard_v7" // 每次修改逻辑最好升一下版本号
   const cachedData = await getCache(cacheKey)
-  if (cachedData) return success(res, cachedData)
+  // 1. 尝试从缓存取 (node-cache 是同步的，不需要 await)
+  if (cachedData) {
+    return success(res, cachedData)
+  }
 
   try {
-    const createFetcher = (typeFunc) =>
-      smartFetch((s) => ({ ac: "detail", at: "json", pg: 1, ...typeFunc(s) }))
+    // 🛠️ 辅助函数：根据标准 ID (如 3=综艺) 自动去当前源配置里找映射 ID (如量子=25)
+    // 如果找不到映射，就用原 ID
+    const fetchByStdId = (stdId) =>
+      smartFetch((s) => ({
+        ac: "detail",
+        at: "json",
+        pg: 1,
+        t: s.id_map && s.id_map[stdId] ? s.id_map[stdId] : stdId,
+      }))
 
-    const taskLatest = smartFetch(() => ({ ac: "detail", at: "json", pg: 1 }))
-    const taskMovies = createFetcher((s) => ({ t: s.home_map.movie_hot }))
-    const taskTvs = createFetcher((s) => ({ t: s.home_map.tv_cn }))
-    const taskAnimes = createFetcher((s) => ({ t: s.home_map.anime }))
+    // 🛠️ 辅助函数：根据 home_map 配置取 ID
+    const fetchByMap = (mapKey) =>
+      smartFetch((s) => ({
+        ac: "detail",
+        at: "json",
+        pg: 1,
+        t: s.home_map[mapKey],
+      }))
 
+    // 🚀 并发请求 6 个板块
+    // 使用 allSettled 保证即使某个板块挂了，首页也能显示其他内容
     const results = await Promise.allSettled([
-      taskLatest,
-      taskMovies,
-      taskTvs,
-      taskAnimes,
+      smartFetch(() => ({ ac: "detail", at: "json", pg: 1, h: 24 })), // 0. 最新 (Banner)
+      fetchByMap("movie_hot"), // 1. 热门电影
+      fetchByMap("tv_cn"), // 2. 热播剧集
+      fetchByMap("anime"), // 3. 动漫
+      fetchByStdId(3), // 4. 综艺 (标准ID 3)
+      fetchByStdId(20), // 5. 纪录片 (标准ID 20)
     ])
 
-    const logStatus = (name, result) => {
-      if (result.status === "rejected") {
-        console.warn(`⚠️ [首页] ${name} 失败:`, result.reason.message)
-        return []
+    // 数据提取与清洗工具
+    const extract = (result, limit) => {
+      if (result.status === "fulfilled") {
+        return processVideoList(
+          result.value.data.list,
+          result.value.sourceKey,
+          limit
+        )
       }
-      const list = result.value.data.list
-      if (!list || list.length === 0) return []
-      return processVideoList(list, result.value.sourceKey, 12)
+      console.warn(
+        `⚠️ [板块加载失败]:`,
+        result.reason?.message || "Unknown error"
+      )
+      return []
     }
 
     const data = {
-      banners: processVideoList(
-        results[0].status === "fulfilled" ? results[0].value.data.list : [],
-        results[0].status === "fulfilled" ? results[0].value.sourceKey : null,
-        5
-      ),
-      movies: logStatus("电影", results[1]),
-      tvs: logStatus("剧集", results[2]),
-      animes: logStatus("动漫", results[3]),
+      banners: extract(results[0], 5),
+      movies: extract(results[1], 12),
+      tvs: extract(results[2], 12),
+      animes: extract(results[3], 12),
+      varieties: extract(results[4], 12), // 新增：综艺
+      documentaries: extract(results[5], 12), // 新增：纪录片
     }
 
-    // ✨ 2. 存入缓存 (10分钟)
-    await setCache(cacheKey, data, 600)
+    // 2. 存入缓存 (10分钟 = 600秒)
+    await setCache(cacheKey, data, 600) // 10分钟
 
     success(res, data)
   } catch (e) {
-    console.error("Home Error:", e)
-    fail(res, "首页服务繁忙")
+    console.error("Home Fatal Error:", e)
+    fail(res, "首页服务繁忙，请稍后重试")
   }
 })
-
 // [搜索]
 app.get("/api/videos", async (req, res) => {
   const { t, pg, wd, h, year, by } = req.query
@@ -332,6 +351,7 @@ app.get("/api/videos", async (req, res) => {
     success(res, {
       list,
       total: result.data.total,
+      pagecount: result.data.pagecount || Math.ceil(result.data.total / 20),
       source: result.sourceName,
     })
   } catch (e) {
@@ -339,12 +359,13 @@ app.get("/api/videos", async (req, res) => {
   }
 })
 
-// [详情]
+// [详情] - 修复 500 错误，增加容错
 app.get("/api/detail/:id", async (req, res) => {
   const { id } = req.params
   let sourceKey = PRIORITY_LIST[0]
   let vodId = id
 
+  // 解析 ID: "liangzi$12345" -> sourceKey="liangzi", vodId="12345"
   if (id.includes("$")) {
     const parts = id.split("$")
     sourceKey = parts[0]
@@ -352,26 +373,54 @@ app.get("/api/detail/:id", async (req, res) => {
   }
 
   try {
+    // 检查源是否存在，不存在则回退默认
+    if (!sources[sourceKey]) sourceKey = PRIORITY_LIST[0]
+
     const result = await smartFetch(
-      () => ({ ac: "detail", at: "json", ids: vodId }),
+      () => ({
+        ac: "detail",
+        at: "json",
+        ids: vodId,
+      }),
       sourceKey
     )
 
+    // 🛡️ 防御性检查：确保数据存在
+    if (
+      !result ||
+      !result.data ||
+      !result.data.list ||
+      result.data.list.length === 0
+    ) {
+      return fail(res, "源站未返回数据", 404)
+    }
+
     const detail = result.data.list[0]
+
+    // 播放地址解析
     const parseEpisodes = (urlStr, fromStr) => {
       if (!urlStr) return []
       const froms = (fromStr || "").split("$$$")
       const urls = urlStr.split("$$$")
-      let idx = froms.findIndex((f) => f.toLowerCase().includes("m3u8"))
+
+      // 优先找 m3u8，找不到就用第一个
+      let idx = froms.findIndex((f) => f && f.toLowerCase().includes("m3u8"))
       if (idx === -1) idx = 0
-      const targetUrl = urls[idx] || urls[0]
+
+      const targetUrl = urls[idx] || ""
+      if (!targetUrl) return []
+
       return targetUrl.split("#").map((ep) => {
-        const [name, link] = ep.split("$")
-        return { name: link ? name : "正片", link: link || name }
+        const parts = ep.split("$")
+        // 兼容不同的分隔格式
+        const name = parts.length > 1 ? parts[0] : "正片"
+        const link = parts.length > 1 ? parts[1] : parts[0]
+        return { name, link }
       })
     }
 
     success(res, {
+      // 统一返回带源前缀的 ID，确保历史记录存的是对的
       id: `${sourceKey}$${detail.vod_id}`,
       title: detail.vod_name,
       overview: (detail.vod_content || "").replace(/<[^>]+>/g, "").trim(),
@@ -386,7 +435,9 @@ app.get("/api/detail/:id", async (req, res) => {
       episodes: parseEpisodes(detail.vod_play_url, detail.vod_play_from),
     })
   } catch (e) {
-    fail(res, "资源未找到")
+    console.error("Detail Error:", e.message)
+    // 返回 404 而不是 500，前端可以据此显示"资源丢失"页面
+    fail(res, "资源获取失败或源站超时", 404)
   }
 })
 
@@ -449,65 +500,76 @@ app.get("/api/user/history", async (req, res) => {
   }
 })
 
-// [History] 保存/更新历史记录 (增强健壮性版)
+// [用户历史] - 修复更新集数不生效的问题
 app.post("/api/user/history", async (req, res) => {
   const { username, video, episodeIndex, progress } = req.body
-
-  // 1. 基础校验
-  if (!username || !video || !video.id) {
-    return fail(res, "参数缺失", 400)
-  }
+  if (!username || !video || !video.id) return fail(res, "参数错误", 400)
 
   try {
     const user = await User.findOne({ username })
     if (!user) return fail(res, "用户不存在", 404)
 
-    // 2. 统一 ID 格式 (转为字符串，防止 Int/String 混用导致匹配失败)
+    // 清洗 ID：确保 ID 格式一致（全部转为字符串）
     const targetId = String(video.id)
+    // 尝试提取纯数字 ID 用于模糊匹配 (解决旧数据 "123" 和新数据 "liangzi$123" 不匹配的问题)
+    const rawId = targetId.includes("$") ? targetId.split("$")[1] : targetId
 
-    // 3. 构建新记录对象
+    // 1. 过滤掉旧记录
+    // 逻辑：只要 ID 完全相等，或者 ID 的后缀数字相等，都视为同一个视频，删掉旧的
+    let newHistory = (user.history || []).filter((h) => {
+      const hId = String(h.id)
+      const hRawId = hId.includes("$") ? hId.split("$")[1] : hId
+      return hId !== targetId && hRawId !== rawId
+    })
+
+    // 2. 构造新记录
     const historyItem = {
-      id: targetId,
-      title: video.title || "未知视频",
-      poster: video.poster || "",
-      type: video.type || "其他",
-      // 确保进度是数字
-      episodeIndex: Number(episodeIndex) || 0,
-      progress: Number(progress) || 0,
+      ...video,
+      id: targetId, // 确保存入的是最新的带前缀 ID
+      episodeIndex: parseInt(episodeIndex) || 0, // 强制转数字
+      progress: parseFloat(progress) || 0, // 强制转数字
       viewedAt: new Date().toISOString(),
     }
 
-    // 4. 核心去重逻辑：移除旧的同名记录 (无论 ID 是 '123' 还是 'sony$123')
-    // 如果你想更严格，可以只按 ID 去重。但考虑到你换了 ID 格式，
-    // 为了防止出现两条《复仇者联盟》(一条旧ID，一条新ID)，我们可以加一个 Title 辅助判断（可选）
+    // 3. 插入头部
+    newHistory.unshift(historyItem)
+    user.history = newHistory.slice(0, 50)
 
-    let currentHistory = user.history || []
-
-    // 过滤掉：1. ID 相同的; 2. (可选) 标题相同且 ID 格式不兼容的脏数据
-    currentHistory = currentHistory.filter((h) => {
-      const hId = String(h.id)
-      // 如果 ID 完全相等，删掉
-      if (hId === targetId) return false
-      return true
-    })
-
-    // 5. 插入头部
-    currentHistory.unshift(historyItem)
-
-    // 6. 限制最大条数 (50条)，防止数据库膨胀
-    if (currentHistory.length > 50) {
-      currentHistory = currentHistory.slice(0, 50)
-    }
-
-    // 7. 保存
-    user.history = currentHistory
-    user.markModified("history") // 关键：告诉 Mongoose 混合类型已修改
+    // 4. 强制标记修改 (Mongoose 对混合类型数组有时检测不到变化)
+    user.markModified("history")
     await user.save()
-    console.log("History Saved:", username)
+
+    console.log(
+      `✅ [History] ${username} -> ${video.title} (Ep:${episodeIndex})`
+    )
     success(res, user.history)
   } catch (e) {
     console.error("History Save Error:", e)
     fail(res, "保存失败")
+  }
+})
+
+// 清空历史记录
+app.delete("/api/user/history", async (req, res) => {
+  const { username } = req.query // 使用 query 参数传递用户名
+  if (!username) return fail(res, "用户名不能为空", 400)
+
+  try {
+    const user = await User.findOne({ username })
+    if (!user) return fail(res, "用户不存在", 404)
+
+    // 直接清空数组
+    user.history = []
+
+    // 标记修改并保存
+    user.markModified("history")
+    await user.save()
+
+    console.log(`🗑️ [History] Cleared for ${username}`)
+    success(res, [])
+  } catch (e) {
+    console.error("Clear History Error:", e)
+    fail(res, "清空失败")
   }
 })
 
