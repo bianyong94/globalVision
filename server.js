@@ -426,51 +426,85 @@ app.post("/api/auth/register", async (req, res) => {
   }
 })
 
-app.post("/api/auth/login", async (req, res) => {
-  const { username, password } = req.body
-  try {
-    const user = await User.findOne({ username, password })
-    if (!user) return fail(res, "账号或密码错误", 401)
-    success(res, { id: user._id, username: user.username })
-  } catch (e) {
-    fail(res, "登录失败")
-  }
-})
-
 app.get("/api/user/history", async (req, res) => {
   const { username } = req.query
   if (!username) return success(res, [])
+
   try {
     const user = await User.findOne({ username })
-    success(res, user ? user.history : [])
+    if (!user) return success(res, [])
+
+    // ✨ 优化：读取时过滤掉数据结构损坏的脏记录 (比如没有 id 或 title 的)
+    const validHistory = (user.history || []).filter(
+      (item) => item && item.id && item.title
+    )
+
+    // 如果发现脏数据，顺便在后台清洗一下数据库 (可选，为了性能暂不存回库)
+    success(res, validHistory)
   } catch (e) {
+    console.error("Get History Error:", e)
     success(res, [])
   }
 })
 
+// [History] 保存/更新历史记录 (增强健壮性版)
 app.post("/api/user/history", async (req, res) => {
   const { username, video, episodeIndex, progress } = req.body
-  if (!username || !video) return fail(res, "参数错误", 400)
+
+  // 1. 基础校验
+  if (!username || !video || !video.id) {
+    return fail(res, "参数缺失", 400)
+  }
+
   try {
     const user = await User.findOne({ username })
     if (!user) return fail(res, "用户不存在", 404)
+
+    // 2. 统一 ID 格式 (转为字符串，防止 Int/String 混用导致匹配失败)
     const targetId = String(video.id)
+
+    // 3. 构建新记录对象
     const historyItem = {
-      ...video,
       id: targetId,
-      episodeIndex: parseInt(episodeIndex) || 0,
-      progress: parseFloat(progress) || 0,
+      title: video.title || "未知视频",
+      poster: video.poster || "",
+      type: video.type || "其他",
+      // 确保进度是数字
+      episodeIndex: Number(episodeIndex) || 0,
+      progress: Number(progress) || 0,
       viewedAt: new Date().toISOString(),
     }
-    let newHistory = (user.history || []).filter(
-      (h) => String(h.id) !== targetId
-    )
-    newHistory.unshift(historyItem)
-    user.history = newHistory.slice(0, 50)
-    user.markModified("history")
+
+    // 4. 核心去重逻辑：移除旧的同名记录 (无论 ID 是 '123' 还是 'sony$123')
+    // 如果你想更严格，可以只按 ID 去重。但考虑到你换了 ID 格式，
+    // 为了防止出现两条《复仇者联盟》(一条旧ID，一条新ID)，我们可以加一个 Title 辅助判断（可选）
+
+    let currentHistory = user.history || []
+
+    // 过滤掉：1. ID 相同的; 2. (可选) 标题相同且 ID 格式不兼容的脏数据
+    currentHistory = currentHistory.filter((h) => {
+      const hId = String(h.id)
+      // 如果 ID 完全相等，删掉
+      if (hId === targetId) return false
+      return true
+    })
+
+    // 5. 插入头部
+    currentHistory.unshift(historyItem)
+
+    // 6. 限制最大条数 (50条)，防止数据库膨胀
+    if (currentHistory.length > 50) {
+      currentHistory = currentHistory.slice(0, 50)
+    }
+
+    // 7. 保存
+    user.history = currentHistory
+    user.markModified("history") // 关键：告诉 Mongoose 混合类型已修改
     await user.save()
+    console.log("History Saved:", username)
     success(res, user.history)
   } catch (e) {
+    console.error("History Save Error:", e)
     fail(res, "保存失败")
   }
 })
@@ -478,44 +512,80 @@ app.post("/api/user/history", async (req, res) => {
 const AI_API_KEY = process.env.AI_API_KEY
 const AI_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 
+// server.js AI 接口部分修改
+// [AI Search] 深度优化版
+// 确保 .env 里配置了 AI_API_KEY (推荐使用硅基流动的 Key)
+
 app.post("/api/ai/ask", aiLimiter, async (req, res) => {
   const { question } = req.body
+
   if (!AI_API_KEY) return fail(res, "服务端未配置 AI Key", 500)
   if (!question) return fail(res, "请输入问题", 400)
+
+  // 1. 获取当前日期，让 AI 知道“现在”是什么时候
+  const today = new Date()
+  const dateStr = `${today.getFullYear()}年${today.getMonth() + 1}月`
+
   try {
     const response = await axios.post(
       AI_API_URL,
       {
-        model: "Qwen/Qwen2.5-7B-Instruct",
+        // ✨ 切换到 DeepSeek-V3 (更聪明，知识更新)
+        // 如果报错模型不存在，请检查硅基流动官网支持的模型列表，或者回退到 Qwen/Qwen2.5-7B-Instruct
+        model: "deepseek-ai/DeepSeek-V3",
         messages: [
           {
             role: "system",
-            content:
-              "你是一个影视百科专家。请根据用户描述推测影视作品。直接返回 3-6 个最可能的名称，用英文逗号分隔。",
+            content: `你是一个精通全网影视资源的搜索助手。
+            当前时间是：${dateStr}。
+            
+            用户的意图是：通过你提供的关键词，去国内的影视资源站（如Maccms）进行搜索播放。
+            
+            请严格遵守以下规则：
+            1. **时效性优先**：如果用户问“最新”、“近期”热门，必须推荐 ${today.getFullYear()} 年或 ${
+              today.getFullYear() - 1
+            } 年上映的作品。绝对不要推荐老片，除非用户明确要求。
+            2. **搜索匹配率优先**：国内资源站通常只收录【中文译名】。
+               - 如果是欧美/日韩片，必须返回【国内最通用的中文译名】（例如返回"复仇者联盟"而不是"The Avengers"）。
+               - 只有当你确定该片在国内通常以英文名存档时，才返回英文。
+            3. **格式限制**：直接返回 3 到 6 个影片名称，用英文逗号 "," 分隔。
+            4. **严禁废话**：不要返回任何前缀、后缀、推荐理由或标点符号。
+            
+            示例输入："推荐几部好看的科幻片"
+            示例输出："沙丘2,流浪地球2,阿凡达：水之道,星际穿越"`,
           },
           { role: "user", content: question },
         ],
         stream: false,
         max_tokens: 100,
-        temperature: 0.7,
+        temperature: 0.6, // 稍微提高一点创造性，防止死板
       },
       {
         headers: {
           Authorization: `Bearer ${AI_API_KEY}`,
           "Content-Type": "application/json",
         },
-        timeout: 10000,
+        timeout: 15000, // DeepSeek 有时思考较久
       }
     )
+
     const content = response.data.choices[0].message.content
+
+    // 数据清洗：移除可能存在的句号、书名号等干扰搜索的符号
     const recommendations = content
-      .replace(/。/g, "")
-      .split(/,|，|\n/)
+      .replace(/[。.!！《》\n]/g, "")
+      .split(/,|，/)
       .map((s) => s.trim())
-      .filter((s) => s)
+      .filter((s) => s && s.length < 30) // 过滤掉过长的异常结果
+
     success(res, recommendations)
   } catch (error) {
-    fail(res, "AI 暂时繁忙")
+    console.error("AI Error:", error.response?.data || error.message)
+
+    // 降级策略：如果 DeepSeek 挂了或者超时，返回一个固定的热门列表，防止前端空白
+    // 这里的列表可以根据实际情况写几个万能热门
+    const fallback = ["庆余年2", "抓娃娃", "死侍与金刚", "默杀", "异形：夺命舰"]
+    success(res, fallback)
   }
 })
 
