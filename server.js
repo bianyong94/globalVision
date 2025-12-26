@@ -591,6 +591,51 @@ app.post("/api/ai/ask", aiLimiter, async (req, res) => {
   }
 })
 
+// ==========================================
+// [补全] 用户认证接口 (Login & Register)
+// ==========================================
+
+// 注册
+app.post("/api/auth/register", async (req, res) => {
+  const { username, password } = req.body
+  try {
+    const existing = await User.findOne({ username })
+    if (existing) return fail(res, "用户已存在", 400)
+
+    // 注意：生产环境建议这里使用 bcrypt 对 password 进行加密后再存
+    const newUser = new User({ username, password })
+    await newUser.save()
+
+    success(res, { id: newUser._id, username })
+  } catch (e) {
+    console.error("Register Error:", e)
+    fail(res, "注册失败")
+  }
+})
+
+// 登录
+app.post("/api/auth/login", async (req, res) => {
+  const { username, password } = req.body
+  try {
+    // 1. 查找用户
+    const user = await User.findOne({ username, password })
+
+    if (!user) {
+      return fail(res, "账号或密码错误", 401)
+    }
+
+    // 2. 返回用户信息 (不返回密码)
+    success(res, {
+      id: user._id,
+      username: user.username,
+      // 如果有头像或其他字段也可以在这里返回
+    })
+  } catch (e) {
+    console.error("Login Error:", e)
+    fail(res, "登录失败")
+  }
+})
+
 app.use((err, req, res, next) => {
   console.error("Global Error:", err)
   res.status(500).json({ code: 500, message: "Server Internal Error" })
