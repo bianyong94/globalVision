@@ -92,6 +92,8 @@ const corsOptions = {
           process.env.FRONTEND_URL,
           "https://maizi93.zeabur.app",
           "https://global-vision-web.vercel.app",
+          "https://www.bycurry.cc", // 你的新前端
+          "https://bycurry.cc", // 你的根域名
         ]
       : "*",
   optionsSuccessStatus: 200,
