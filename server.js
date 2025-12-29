@@ -168,25 +168,47 @@ const getAxiosConfig = () => {
   return config
 }
 
-const smartFetch = async (paramsFn, specificSourceKey = null) => {
+/**
+ * 🚀 智能并发请求 (升级版)
+ * @param paramsFn 参数生成函数
+ * @param options 配置项: 可以是字符串(指定源Key) 或者 对象 { key: string, scanAll: boolean }
+ */
+const smartFetch = async (paramsFn, options = null) => {
   let targetKeys = []
 
+  // 解析参数
+  const specificSourceKey = typeof options === "string" ? options : options?.key
+  const scanAll = typeof options === "object" ? options?.scanAll : false
+
   if (specificSourceKey) {
+    // 1. 指定了特定源 (用于详情页)
     targetKeys = [specificSourceKey]
   } else {
-    targetKeys = PRIORITY_LIST.filter(
+    // 2. 列表页逻辑
+    const healthyKeys = PRIORITY_LIST.filter(
       (key) => sourceHealth[key].deadUntil <= Date.now()
-    ).slice(0, 3)
+    )
+
+    if (scanAll) {
+      // 🔥 扫荡模式：搜索体育等稀缺资源时，尝试所有健康源，不限制数量
+      targetKeys = healthyKeys
+    } else {
+      // ⚡️ 竞速模式：普通板块只取前 3 个最快的源，提升首页速度
+      targetKeys = healthyKeys.slice(0, 3)
+    }
   }
 
-  if (targetKeys.length === 0) targetKeys = [PRIORITY_LIST[0]]
+  if (targetKeys.length === 0) targetKeys = [PRIORITY_LIST[0]] // 兜底
 
+  // ... (下方的请求逻辑保持不变) ...
   const requests = targetKeys.map(async (key) => {
+    // ... 原有的 map 逻辑 ...
     const source = sources[key]
     if (!source) throw new Error("Config missing")
 
     try {
       const params = paramsFn(source)
+      // 搜索模式下，有些源不支持 t 和 wd 同时传，这里可以做个防御，但通常带wd即可
       const response = await axios.get(source.url, {
         params,
         ...getAxiosConfig(),
@@ -215,7 +237,7 @@ const smartFetch = async (paramsFn, specificSourceKey = null) => {
   try {
     return await Promise.any(requests)
   } catch (err) {
-    throw new Error("所有线路繁忙")
+    throw new Error("所有线路繁忙或无数据")
   }
 }
 
@@ -255,18 +277,16 @@ const processVideoList = (list, sourceKey, limit = 12) => {
 // 5. API 路由 (已集成 Redis)
 // ==========================================
 
-// [首页聚合] - 修复版 (包含综艺、纪录片、ID自动映射)
+// [首页聚合] - 最终完整版 (含电影、剧集、动漫、综艺、纪录片、体育)
 app.get("/api/home/trending", async (req, res) => {
-  const cacheKey = "home_dashboard_v7" // 每次修改逻辑最好升一下版本号
+  const cacheKey = "home_dashboard_v9" // 升级版本号
+
+  // 1. 尝试从缓存取
   const cachedData = await getCache(cacheKey)
-  // 1. 尝试从缓存取 (node-cache 是同步的，不需要 await)
-  if (cachedData) {
-    return success(res, cachedData)
-  }
+  if (cachedData) return success(res, cachedData)
 
   try {
-    // 🛠️ 辅助函数：根据标准 ID (如 3=综艺) 自动去当前源配置里找映射 ID (如量子=25)
-    // 如果找不到映射，就用原 ID
+    // 🛠️ 辅助函数1：根据标准 ID 找映射 ID (用于综艺/纪录片)
     const fetchByStdId = (stdId) =>
       smartFetch((s) => ({
         ac: "detail",
@@ -275,7 +295,7 @@ app.get("/api/home/trending", async (req, res) => {
         t: s.id_map && s.id_map[stdId] ? s.id_map[stdId] : stdId,
       }))
 
-    // 🛠️ 辅助函数：根据 home_map 配置取 ID
+    // 🛠️ 辅助函数2：根据 home_map 配置取 ID (用于电影/剧集/动漫)
     const fetchByMap = (mapKey) =>
       smartFetch((s) => ({
         ac: "detail",
@@ -284,19 +304,32 @@ app.get("/api/home/trending", async (req, res) => {
         t: s.home_map[mapKey],
       }))
 
-    // 🚀 并发请求 6 个板块
-    // 使用 allSettled 保证即使某个板块挂了，首页也能显示其他内容
+    // 🛠️ 辅助函数3：按关键词搜索 (专门用于体育，因为体育没有固定ID)
+    const fetchByKeyword = (keyword) =>
+      smartFetch(
+        () => ({
+          ac: "detail",
+          at: "json",
+          pg: 1,
+          wd: keyword,
+        }),
+        { scanAll: true } // 👈 开启扫荡模式，直到找到有 NBA 的源为止
+      )
+
+    // 🚀 并发请求 7 个任务
     const results = await Promise.allSettled([
-      smartFetch(() => ({ ac: "detail", at: "json", pg: 1, h: 24 })), // 0. 最新 (Banner)
-      fetchByMap("movie_hot"), // 1. 热门电影
-      fetchByMap("tv_cn"), // 2. 热播剧集
+      smartFetch(() => ({ ac: "detail", at: "json", pg: 1, h: 24 })), // 0. 最新 Banner
+      fetchByMap("movie_hot"), // 1. 电影
+      fetchByMap("tv_cn"), // 2. 剧集
       fetchByMap("anime"), // 3. 动漫
       fetchByStdId(3), // 4. 综艺 (标准ID 3)
       fetchByStdId(20), // 5. 纪录片 (标准ID 20)
+      fetchByKeyword("NBA"), // 6. 体育 (搜 NBA 最稳，或者搜"篮球")
     ])
 
-    // 数据提取与清洗工具
+    // 数据提取与清洗
     const extract = (result, limit) => {
+      if (!result) return []
       if (result.status === "fulfilled") {
         return processVideoList(
           result.value.data.list,
@@ -304,11 +337,7 @@ app.get("/api/home/trending", async (req, res) => {
           limit
         )
       }
-      console.warn(
-        `⚠️ [板块加载失败]:`,
-        result.reason?.message || "Unknown error"
-      )
-      return []
+      return [] // 失败返回空数组
     }
 
     const data = {
@@ -316,12 +345,13 @@ app.get("/api/home/trending", async (req, res) => {
       movies: extract(results[1], 12),
       tvs: extract(results[2], 12),
       animes: extract(results[3], 12),
-      varieties: extract(results[4], 12), // 新增：综艺
-      documentaries: extract(results[5], 12), // 新增：纪录片
+      varieties: extract(results[4], 12), // 综艺
+      documentaries: extract(results[5], 12), // 纪录片
+      sports: extract(results[20], 12), // 体育 (新增)
     }
 
-    // 2. 存入缓存 (10分钟 = 600秒)
-    await setCache(cacheKey, data, 600) // 10分钟
+    // 2. 存入缓存
+    await setCache(cacheKey, data, 600)
 
     success(res, data)
   } catch (e) {
@@ -329,6 +359,7 @@ app.get("/api/home/trending", async (req, res) => {
     fail(res, "首页服务繁忙，请稍后重试")
   }
 })
+
 // [搜索]
 app.get("/api/videos", async (req, res) => {
   const { t, pg, wd, h, year, by } = req.query
@@ -339,6 +370,12 @@ app.get("/api/videos", async (req, res) => {
       if (t) params.t = source.id_map && source.id_map[t] ? source.id_map[t] : t
       if (wd) params.wd = wd
       if (h) params.h = h
+      // 🔥 修复3：透传排序参数
+      // 绝大多数 CMS 支持 &by=time (时间), &by=hits (热度), &by=score (评分)
+      if (by) {
+        params.order = by // 有些 CMS 用 order
+        params.by = by // 有些 CMS 用 by，两个都传保险
+      }
       return params
     })
 
