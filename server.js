@@ -173,46 +173,49 @@ const getAxiosConfig = () => {
  * @param paramsFn 参数生成函数
  * @param options 配置项: 可以是字符串(指定源Key) 或者 对象 { key: string, scanAll: boolean }
  */
+/**
+ * 🚀 智能并发请求 (升级版 - 带测速)
+ */
 const smartFetch = async (paramsFn, options = null) => {
   let targetKeys = []
 
-  // 解析参数
+  // ... (保留原有的 key 选择逻辑，这部分不变) ...
   const specificSourceKey = typeof options === "string" ? options : options?.key
   const scanAll = typeof options === "object" ? options?.scanAll : false
 
   if (specificSourceKey) {
-    // 1. 指定了特定源 (用于详情页)
     targetKeys = [specificSourceKey]
   } else {
-    // 2. 列表页逻辑
     const healthyKeys = PRIORITY_LIST.filter(
       (key) => sourceHealth[key].deadUntil <= Date.now()
     )
-
     if (scanAll) {
-      // 🔥 扫荡模式：搜索体育等稀缺资源时，尝试所有健康源，不限制数量
       targetKeys = healthyKeys
     } else {
-      // ⚡️ 竞速模式：普通板块只取前 3 个最快的源，提升首页速度
       targetKeys = healthyKeys.slice(0, 3)
     }
   }
 
-  if (targetKeys.length === 0) targetKeys = [PRIORITY_LIST[0]] // 兜底
+  if (targetKeys.length === 0) targetKeys = [PRIORITY_LIST[0]]
 
-  // ... (下方的请求逻辑保持不变) ...
+  //Map 请求任务
   const requests = targetKeys.map(async (key) => {
-    // ... 原有的 map 逻辑 ...
     const source = sources[key]
     if (!source) throw new Error("Config missing")
 
     try {
       const params = paramsFn(source)
-      // 搜索模式下，有些源不支持 t 和 wd 同时传，这里可以做个防御，但通常带wd即可
+
+      // ⏱️ [新增] 开始计时
+      const startTime = Date.now()
+
       const response = await axios.get(source.url, {
         params,
         ...getAxiosConfig(),
       })
+
+      // ⏱️ [新增] 结束计时 & 计算耗时
+      const duration = Date.now() - startTime
 
       if (
         response.data &&
@@ -220,10 +223,12 @@ const smartFetch = async (paramsFn, options = null) => {
         response.data.list.length > 0
       ) {
         markSourceSuccess(key)
+        // ✅ [新增] 返回 duration (耗时)
         return {
           data: response.data,
           sourceName: source.name,
           sourceKey: key,
+          duration: duration, // 单位 ms
         }
       } else {
         throw new Error("Empty Data")
@@ -254,6 +259,7 @@ const processVideoList = (list, sourceKey, limit = 12) => {
 
   const processed = list.map((item) => ({
     id: `${sourceKey}$${item.vod_id}`,
+    // id: `${sourceKey}$${item.vod_id}`,
     title: item.vod_name,
     type: item.type_name,
     poster: item.vod_pic,
@@ -361,20 +367,21 @@ app.get("/api/home/trending", async (req, res) => {
 })
 
 // [搜索]
+// [搜索]
 app.get("/api/videos", async (req, res) => {
-  const { t, pg, wd, h, year, by } = req.query
+  const { t, pg, wd, h, year, by, fixedSource } = req.query
 
   try {
+    const fetchOptions = fixedSource ? fixedSource : null
+    // smartFetch 现在会返回 duration
     const result = await smartFetch((source) => {
       const params = { ac: "detail", at: "json", pg: pg || 1 }
       if (t) params.t = source.id_map && source.id_map[t] ? source.id_map[t] : t
       if (wd) params.wd = wd
       if (h) params.h = h
-      // 🔥 修复3：透传排序参数
-      // 绝大多数 CMS 支持 &by=time (时间), &by=hits (热度), &by=score (评分)
       if (by) {
-        params.order = by // 有些 CMS 用 order
-        params.by = by // 有些 CMS 用 by，两个都传保险
+        params.order = by
+        params.by = by
       }
       return params
     })
@@ -389,7 +396,11 @@ app.get("/api/videos", async (req, res) => {
       list,
       total: result.data.total,
       pagecount: result.data.pagecount || Math.ceil(result.data.total / 20),
-      source: result.sourceName,
+
+      // ✅ [新增] 返回源信息和速度
+      source: result.sourceName, // 源名称 (如: 索尼资源)
+      sourceKey: result.sourceKey, // 源Key (如: sony)
+      latency: result.duration, // 耗时 (如: 245)
     })
   } catch (e) {
     success(res, { list: [] })
@@ -397,12 +408,12 @@ app.get("/api/videos", async (req, res) => {
 })
 
 // [详情] - 修复 500 错误，增加容错
+
 app.get("/api/detail/:id", async (req, res) => {
   const { id } = req.params
   let sourceKey = PRIORITY_LIST[0]
   let vodId = id
 
-  // 解析 ID: "liangzi$12345" -> sourceKey="liangzi", vodId="12345"
   if (id.includes("$")) {
     const parts = id.split("$")
     sourceKey = parts[0]
@@ -410,7 +421,6 @@ app.get("/api/detail/:id", async (req, res) => {
   }
 
   try {
-    // 检查源是否存在，不存在则回退默认
     if (!sources[sourceKey]) sourceKey = PRIORITY_LIST[0]
 
     const result = await smartFetch(
@@ -422,7 +432,6 @@ app.get("/api/detail/:id", async (req, res) => {
       sourceKey
     )
 
-    // 🛡️ 防御性检查：确保数据存在
     if (
       !result ||
       !result.data ||
@@ -434,22 +443,18 @@ app.get("/api/detail/:id", async (req, res) => {
 
     const detail = result.data.list[0]
 
-    // 播放地址解析
+    // ... (parseEpisodes 函数保持不变) ...
     const parseEpisodes = (urlStr, fromStr) => {
+      // ... 原有逻辑 ...
       if (!urlStr) return []
       const froms = (fromStr || "").split("$$$")
       const urls = urlStr.split("$$$")
-
-      // 优先找 m3u8，找不到就用第一个
       let idx = froms.findIndex((f) => f && f.toLowerCase().includes("m3u8"))
       if (idx === -1) idx = 0
-
       const targetUrl = urls[idx] || ""
       if (!targetUrl) return []
-
       return targetUrl.split("#").map((ep) => {
         const parts = ep.split("$")
-        // 兼容不同的分隔格式
         const name = parts.length > 1 ? parts[0] : "正片"
         const link = parts.length > 1 ? parts[1] : parts[0]
         return { name, link }
@@ -457,7 +462,6 @@ app.get("/api/detail/:id", async (req, res) => {
     }
 
     success(res, {
-      // 统一返回带源前缀的 ID，确保历史记录存的是对的
       id: `${sourceKey}$${detail.vod_id}`,
       title: detail.vod_name,
       overview: (detail.vod_content || "").replace(/<[^>]+>/g, "").trim(),
@@ -470,14 +474,16 @@ app.get("/api/detail/:id", async (req, res) => {
       remarks: detail.vod_remarks,
       rating: detail.vod_score,
       episodes: parseEpisodes(detail.vod_play_url, detail.vod_play_from),
+
+      // ✅ [新增] 返回源信息和速度
+      source: result.sourceName, // 当前使用的源
+      latency: result.duration, // 响应耗时(ms)
     })
   } catch (e) {
     console.error("Detail Error:", e.message)
-    // 返回 404 而不是 500，前端可以据此显示"资源丢失"页面
     fail(res, "资源获取失败或源站超时", 404)
   }
 })
-
 // [分类] - 使用 Redis 缓存
 app.get("/api/categories", async (req, res) => {
   const cacheKey = "categories_list"
