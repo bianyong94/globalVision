@@ -11,6 +11,7 @@ const compression = require("compression")
 const rateLimit = require("express-rate-limit")
 const { HttpsProxyAgent } = require("https-proxy-agent")
 const Redis = require("ioredis") // ✨ 新增：引入 Redis
+const Video = require("./models/Video") // 确保路径正确
 
 // 引入源配置
 const { sources, PRIORITY_LIST } = require("./config/sources")
@@ -366,51 +367,151 @@ app.get("/api/home/trending", async (req, res) => {
   }
 })
 
-// [搜索]
-// [搜索]
+// [混合搜索] - 本地 + 网络互补
 app.get("/api/videos", async (req, res) => {
-  const { t, pg, wd, h, year, by, fixedSource } = req.query
+  const { wd } = req.query // 搜索词
 
   try {
-    const fetchOptions = fixedSource ? fixedSource : null
-    // smartFetch 现在会返回 duration
-    const result = await smartFetch((source) => {
-      const params = { ac: "detail", at: "json", pg: pg || 1 }
-      if (t) params.t = source.id_map && source.id_map[t] ? source.id_map[t] : t
-      if (wd) params.wd = wd
-      if (h) params.h = h
-      if (by) {
-        params.order = by
-        params.by = by
-      }
-      return params
+    // 1. 先搜本地 MongoDB (支持搜演员、导演、片名)
+    let localList = await Video.find({
+      $or: [
+        { title: { $regex: wd, $options: "i" } },
+        { actors: { $regex: wd, $options: "i" } },
+      ],
     })
+      .limit(20)
+      .lean() // .lean() 转为普通 JS 对象方便修改
 
-    let list = processVideoList(result.data.list, result.sourceKey, 100)
-    if (year && year !== "全部") {
-      list = list.filter((v) => v.year == year)
+    // 2. 标记本地数据来源 (给前端看)
+    localList = localList.map((v) => ({ ...v, source: "Local" }))
+
+    // 3. 如果本地结果少于 5 个，认为可能库不全，触发 API 搜索补充
+    if (localList.length < 5) {
+      console.log(`本地结果仅 ${localList.length} 条，触发 API 补充搜索...`)
+
+      try {
+        // 调用之前的 smartFetch 去源站搜
+        const apiResult = await smartFetch(() => ({ ac: "detail", wd: wd }))
+        const apiList = processVideoList(
+          apiResult.data.list,
+          apiResult.sourceKey
+        )
+
+        // 4. 合并数据 & 去重
+        // 简单的去重逻辑：如果 API 返回的片名在本地已经有了，就不要了
+        const localTitles = new Set(localList.map((v) => v.title))
+
+        for (const item of apiList) {
+          if (!localTitles.has(item.title)) {
+            localList.push(item)
+          }
+        }
+      } catch (err) {
+        // API 搜不到也没关系，至少有本地的
+        console.log("API 补充搜索失败或无结果")
+      }
     }
-    if (by === "score") list.sort((a, b) => b.rating - a.rating)
+
+    success(res, {
+      list: localList,
+      total: localList.length,
+      source: "Hybrid (Local + API)",
+    })
+  } catch (e) {
+    fail(res, "搜索出错")
+  }
+})
+
+// [本地增强搜索] - 支持搜片名和演员
+app.get("/api/local/search", async (req, res) => {
+  const { q, page = 1, limit = 20 } = req.query
+
+  if (!q) return fail(res, "缺少关键词", 400)
+
+  try {
+    // 构造查询条件：片名包含 OR 演员包含 OR 导演包含
+    const query = {
+      $or: [
+        { title: { $regex: q, $options: "i" } }, // i 表示忽略大小写
+        { actors: { $regex: q, $options: "i" } },
+        { director: { $regex: q, $options: "i" } },
+      ],
+    }
+
+    const skip = (page - 1) * limit
+
+    // 并行查询：查列表 + 查总数
+    const [list, total] = await Promise.all([
+      Video.find(query)
+        .select("id title poster type year remarks rating actors") // 只取列表需要的字段
+        .sort({ year: -1, updatedAt: -1 }) // 按年份倒序
+        .skip(skip)
+        .limit(parseInt(limit)),
+      Video.countDocuments(query),
+    ])
 
     success(res, {
       list,
-      total: result.data.total,
-      pagecount: result.data.pagecount || Math.ceil(result.data.total / 20),
-
-      // ✅ [新增] 返回源信息和速度
-      source: result.sourceName, // 源名称 (如: 索尼资源)
-      sourceKey: result.sourceKey, // 源Key (如: sony)
-      latency: result.duration, // 耗时 (如: 245)
+      total,
+      page: parseInt(page),
+      pagecount: Math.ceil(total / limit),
+      source: "Local Database", // 标记数据来源
     })
   } catch (e) {
-    success(res, { list: [] })
+    console.error("Local Search Error:", e)
+    fail(res, "本地搜索失败")
   }
 })
 
 // [详情] - 修复 500 错误，增加容错
 
+// [详情] - 数据库优先 + 自动补全策略
 app.get("/api/detail/:id", async (req, res) => {
   const { id } = req.params
+
+  // 🛠️ 提取公共解析函数，避免重复代码
+  const parseEpisodes = (urlStr, fromStr) => {
+    if (!urlStr) return []
+    const froms = (fromStr || "").split("$$$")
+    const urls = urlStr.split("$$$")
+    // 优先找 m3u8，找不到就用第一个
+    let idx = froms.findIndex((f) => f && f.toLowerCase().includes("m3u8"))
+    if (idx === -1) idx = 0
+    const targetUrl = urls[idx] || ""
+    if (!targetUrl) return []
+    return targetUrl.split("#").map((ep) => {
+      const parts = ep.split("$")
+      return {
+        name: parts.length > 1 ? parts[0] : "正片",
+        link: parts.length > 1 ? parts[1] : parts[0],
+      }
+    })
+  }
+
+  // 1. 尝试从 MongoDB 获取
+  try {
+    const localVideo = await Video.findOne({ id: id })
+    if (localVideo) {
+      // ✅ 命中数据库！直接返回
+      res.setHeader("X-Data-Source", "MongoDB")
+      return success(res, {
+        ...localVideo.toObject(),
+        episodes: parseEpisodes(
+          localVideo.vod_play_url,
+          localVideo.vod_play_from
+        ),
+        latency: 0, // 本地读取延迟极低
+      })
+    }
+  } catch (e) {
+    console.error("DB Read Error:", e)
+    // 数据库读失败不应阻塞，继续走下面的 API 请求
+  }
+
+  // ============================================
+  // ⬇️ 以下是 API 回源请求逻辑 (Fallback)
+  // ============================================
+
   let sourceKey = PRIORITY_LIST[0]
   let vodId = id
 
@@ -443,41 +544,50 @@ app.get("/api/detail/:id", async (req, res) => {
 
     const detail = result.data.list[0]
 
-    // ... (parseEpisodes 函数保持不变) ...
-    const parseEpisodes = (urlStr, fromStr) => {
-      // ... 原有逻辑 ...
-      if (!urlStr) return []
-      const froms = (fromStr || "").split("$$$")
-      const urls = urlStr.split("$$$")
-      let idx = froms.findIndex((f) => f && f.toLowerCase().includes("m3u8"))
-      if (idx === -1) idx = 0
-      const targetUrl = urls[idx] || ""
-      if (!targetUrl) return []
-      return targetUrl.split("#").map((ep) => {
-        const parts = ep.split("$")
-        const name = parts.length > 1 ? parts[0] : "正片"
-        const link = parts.length > 1 ? parts[1] : parts[0]
-        return { name, link }
-      })
-    }
-
-    success(res, {
+    // 2. ✨ 核心逻辑：将 API 查到的数据保存到 MongoDB
+    // 构造数据对象 (记得加上 type_id)
+    const videoData = {
       id: `${sourceKey}$${detail.vod_id}`,
       title: detail.vod_name,
-      overview: (detail.vod_content || "").replace(/<[^>]+>/g, "").trim(),
-      poster: detail.vod_pic,
+      // 🔴 关键修复：保存 type_id，修复分类搜索
+      type_id: parseInt(detail.type_id) || 0,
       type: detail.type_name,
-      area: detail.vod_area,
-      year: detail.vod_year,
-      director: detail.vod_director,
-      actors: detail.vod_actor,
+      poster: detail.vod_pic,
       remarks: detail.vod_remarks,
-      rating: detail.vod_score,
+      year: detail.vod_year,
+      rating: parseFloat(detail.vod_score) || 0,
+      date: detail.vod_time,
+      actors: detail.vod_actor || "",
+      director: detail.vod_director || "",
+      overview: (detail.vod_content || "").replace(/<[^>]+>/g, "").trim(),
+      vod_play_from: detail.vod_play_from,
+      vod_play_url: detail.vod_play_url,
+      updatedAt: new Date(),
+    }
+
+    // 异步更新/插入 (使用 updateOne + upsert 防止并发冲突)
+    Video.updateOne({ id: videoData.id }, { $set: videoData }, { upsert: true })
+      .then(() => console.log(`💾 Auto-saved: ${videoData.title}`))
+      .catch((err) => console.error("Auto-Save failed:", err.message))
+
+    // 3. 返回给前端
+    success(res, {
+      id: videoData.id,
+      title: videoData.title,
+      overview: videoData.overview,
+      poster: videoData.poster,
+      type: videoData.type,
+      area: detail.vod_area,
+      year: videoData.year,
+      director: videoData.director,
+      actors: videoData.actors,
+      remarks: videoData.remarks,
+      rating: videoData.rating,
       episodes: parseEpisodes(detail.vod_play_url, detail.vod_play_from),
 
-      // ✅ [新增] 返回源信息和速度
-      source: result.sourceName, // 当前使用的源
-      latency: result.duration, // 响应耗时(ms)
+      // ✅ 返回源信息和速度
+      source: result.sourceName,
+      latency: result.duration,
     })
   } catch (e) {
     console.error("Detail Error:", e.message)
@@ -739,6 +849,20 @@ app.post("/api/auth/login", async (req, res) => {
     console.error("Login Error:", e)
     fail(res, "登录失败")
   }
+})
+
+// server.js 顶部引入
+const cron = require("node-cron")
+const { startSync } = require("./scripts/sync_func") // 把 sync.js 封装成函数导出
+
+// ... 你的其他路由代码 ...
+
+// ⏰ 定时任务：每天凌晨 2:00 执行采集
+// 格式：分 时 日 月 周
+cron.schedule("0 2 * * *", () => {
+  console.log("⏰ 定时任务启动：开始同步数据...")
+  // 调用你的采集函数
+  startSync().catch((err) => console.error("同步失败:", err))
 })
 
 app.use((err, req, res, next) => {
