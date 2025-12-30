@@ -12,6 +12,7 @@ const rateLimit = require("express-rate-limit")
 const { HttpsProxyAgent } = require("https-proxy-agent")
 const Redis = require("ioredis") // ✨ 新增：引入 Redis
 const Video = require("./models/Video") // 确保路径正确
+const { exec } = require("child_process")
 
 // 引入源配置
 const { sources, PRIORITY_LIST, CATEGORY_RELATIONS  } = require("./config/sources")
