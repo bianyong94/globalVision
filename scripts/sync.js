@@ -36,7 +36,7 @@ const formatVideo = (item, sourceKey) => {
 }
 
 // hours = 0 代表采集所有历史数据
-async function syncSource(sourceKey, hours = 0) {
+async function syncSource(sourceKey, hours = 0,startPage = 1) {
   const source = sources[sourceKey]
   if (!source) return
 
@@ -47,7 +47,7 @@ async function syncSource(sourceKey, hours = 0) {
     }`
   )
 
-  let page = 1
+  let page = startPage
   let totalSaved = 0
 
   while (true) {
@@ -115,7 +115,7 @@ async function syncSource(sourceKey, hours = 0) {
 
 async function startSync() {
   // 🟢 第一次初始化：采集茅台所有历史数据 (hours = 0)
-  await syncSource("maotai", 0)
+  await syncSource("maotai", 0, 1)
 
   // 如果你想采其他源，也可以解开：
   // await syncSource("sony", 0);

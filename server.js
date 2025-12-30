@@ -14,7 +14,7 @@ const Redis = require("ioredis") // ✨ 新增：引入 Redis
 const Video = require("./models/Video") // 确保路径正确
 
 // 引入源配置
-const { sources, PRIORITY_LIST } = require("./config/sources")
+const { sources, PRIORITY_LIST, CATEGORY_RELATIONS  } = require("./config/sources")
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -286,6 +286,7 @@ const processVideoList = (list, sourceKey, limit = 12) => {
 
 // [首页聚合] - 最终完整版 (含电影、剧集、动漫、综艺、纪录片、体育)
 app.get("/api/home/trending", async (req, res) => {
+  console.log('开始请求')
   const cacheKey = "home_dashboard_v9" // 升级版本号
 
   // 1. 尝试从缓存取
@@ -445,10 +446,19 @@ app.get("/api/videos", async (req, res) => {
         { director: regex }
       ];
     }
-
-    // 2. 分类筛选
+    // 2. 分类筛选 (修正版：支持父分类查询子分类)
     if (t) {
-      query.type_id = parseInt(t);
+      const typeId = parseInt(t);
+      
+      // 检查这个 ID 是否有子分类 (即是否为父分类)
+      if (CATEGORY_RELATIONS[typeId]) {
+        // ✨ 核心逻辑：如果是父分类，就查询它自己 + 所有子分类
+        // 使用 $in 操作符：type_id 在 [1, 6, 7, 8...] 列表中即可
+        query.type_id = { $in: [typeId, ...CATEGORY_RELATIONS[typeId]] };
+      } else {
+        // 如果是子分类 (比如动作片 6)，就严格匹配
+        query.type_id = typeId;
+      }
     }
 
     // 3. 年份筛选
@@ -457,9 +467,25 @@ app.get("/api/videos", async (req, res) => {
     }
 
     // 4. 排序逻辑
-    let sort = { updatedAt: -1 }; // 默认按采集时间倒序
-    if (by === "score") sort = { rating: -1 };
-    if (by === "year") sort = { year: -1 };
+    let sort = {};
+
+    if (by === "score") {
+      // 按评分：高分优先 -> 新片 -> 最新更新
+      sort = { rating: -1, year: -1, date: -1 };
+    } else if (by === "year") {
+      // 按年份：新片优先 -> 最新更新 -> 高分
+      sort = { year: -1, date: -1, rating: -1 };
+    } else {
+      // 默认（综合排序）：最新时间 + 热度
+      // 策略解析：
+      // 1. year: -1  => 必须先把今年的新片置顶 (防止很久以前的老片因为刚才更新了而在最上面)
+      // 2. date: -1  => 在同一年份里，按源站更新时间倒序 (保证追剧能看到最新集)
+      // 3. rating: -1 => 如果时间一样，优先展示高分的 (热度体现)
+      sort = { year: -1, date: -1, rating: -1 };
+      
+      // 💡 备选策略：如果你更希望“只要更新了就排前面”(不管是不是老片)，可以用下面这个：
+      // sort = { date: -1, rating: -1 }; 
+    }
 
     // -------------------------------------------------
     // 第二步：查询本地数据库
@@ -1041,6 +1067,40 @@ app.post("/api/auth/login", async (req, res) => {
 //   // 调用你的采集函数
 //   startSync().catch((err) => console.error("同步失败:", err))
 // })
+
+// ==========================================
+// 6. 任务调度 (启动时执行一次全量采集)
+// ==========================================
+
+const runSyncTask = () => {
+  console.log(`📅 [${new Date().toLocaleString()}] 🚀 触发一次性采集任务...`);
+  
+  // 启动子进程运行脚本
+  // 脚本里已经写了 process.exit(0)，跑完最后一页会自动退出进程，不会一直占资源
+  const syncProcess = exec("node scripts/sync.js");
+
+  syncProcess.stdout.on("data", (data) => console.log(`[Sync] ${data.trim()}`));
+  syncProcess.stderr.on("data", (data) => console.error(`[Sync Error] ${data}`));
+  
+  syncProcess.on("close", (code) => {
+    console.log(`[Sync] ✅ 采集任务全部完成，进程退出 (Code: ${code})`);
+  });
+};
+
+// 只在生产环境执行，防止本地开发重启时重复跑
+if (process.env.NODE_ENV === 'production') {
+  
+  console.log("⚙️ 生产环境模式：已配置为 [启动后自动执行一次采集]");
+
+  // 延时 5 秒执行，确保服务器主进程先启动完毕，不影响 API 访问
+  setTimeout(() => {
+    runSyncTask();
+  }, 5000);
+
+} else {
+  console.log("🚧 开发环境：不自动执行采集 (请手动运行 node scripts/sync.js)");
+}
+
 
 app.use((err, req, res, next) => {
   console.error("Global Error:", err)
