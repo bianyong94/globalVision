@@ -853,7 +853,7 @@ app.post("/api/auth/login", async (req, res) => {
 
 // server.js 顶部引入
 const cron = require("node-cron")
-const { startSync } = require("./scripts/sync_func") // 把 sync.js 封装成函数导出
+const { startSync } = require("./scripts/sync") // 把 sync.js 封装成函数导出
 
 // ... 你的其他路由代码 ...
 
