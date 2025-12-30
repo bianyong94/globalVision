@@ -368,59 +368,236 @@ app.get("/api/home/trending", async (req, res) => {
 })
 
 // [混合搜索] - 本地 + 网络互补
+// app.get("/api/videos", async (req, res) => {
+//   const { wd } = req.query // 搜索词
+
+//   try {
+//     // 1. 先搜本地 MongoDB (支持搜演员、导演、片名)
+//     let localList = await Video.find({
+//       $or: [
+//         { title: { $regex: wd, $options: "i" } },
+//         { actors: { $regex: wd, $options: "i" } },
+//       ],
+//     })
+//       .limit(20)
+//       .lean() // .lean() 转为普通 JS 对象方便修改
+
+//     // 2. 标记本地数据来源 (给前端看)
+//     localList = localList.map((v) => ({ ...v, source: "Local" }))
+
+//     // 3. 如果本地结果少于 5 个，认为可能库不全，触发 API 搜索补充
+//     if (localList.length < 5) {
+//       console.log(`本地结果仅 ${localList.length} 条，触发 API 补充搜索...`)
+
+//       try {
+//         // 调用之前的 smartFetch 去源站搜
+//         const apiResult = await smartFetch(() => ({ ac: "detail", wd: wd }))
+//         const apiList = processVideoList(
+//           apiResult.data.list,
+//           apiResult.sourceKey
+//         )
+
+//         // 4. 合并数据 & 去重
+//         // 简单的去重逻辑：如果 API 返回的片名在本地已经有了，就不要了
+//         const localTitles = new Set(localList.map((v) => v.title))
+
+//         for (const item of apiList) {
+//           if (!localTitles.has(item.title)) {
+//             localList.push(item)
+//           }
+//         }
+//       } catch (err) {
+//         // API 搜不到也没关系，至少有本地的
+//         console.log("API 补充搜索失败或无结果")
+//       }
+//     }
+
+//     success(res, {
+//       list: localList,
+//       total: localList.length,
+//       source: "Hybrid (Local + API)",
+//     })
+//   } catch (e) {
+//     fail(res, "搜索出错")
+//   }
+// })
+// ==========================================
+// [核心接口] 聚合搜索/列表 (本地优先 + 自动互补)
+// ==========================================
 app.get("/api/videos", async (req, res) => {
-  const { wd } = req.query // 搜索词
+  const { t, pg = 1, wd, h, year, by, fixedSource } = req.query;
+  const page = parseInt(pg);
+  const limit = 20;
+  const skip = (page - 1) * limit;
 
   try {
-    // 1. 先搜本地 MongoDB (支持搜演员、导演、片名)
-    let localList = await Video.find({
-      $or: [
-        { title: { $regex: wd, $options: "i" } },
-        { actors: { $regex: wd, $options: "i" } },
-      ],
-    })
-      .limit(20)
-      .lean() // .lean() 转为普通 JS 对象方便修改
+    // -------------------------------------------------
+    // 第一步：构建本地 MongoDB 查询条件
+    // -------------------------------------------------
+    const query = {};
 
-    // 2. 标记本地数据来源 (给前端看)
-    localList = localList.map((v) => ({ ...v, source: "Local" }))
-
-    // 3. 如果本地结果少于 5 个，认为可能库不全，触发 API 搜索补充
-    if (localList.length < 5) {
-      console.log(`本地结果仅 ${localList.length} 条，触发 API 补充搜索...`)
-
-      try {
-        // 调用之前的 smartFetch 去源站搜
-        const apiResult = await smartFetch(() => ({ ac: "detail", wd: wd }))
-        const apiList = processVideoList(
-          apiResult.data.list,
-          apiResult.sourceKey
-        )
-
-        // 4. 合并数据 & 去重
-        // 简单的去重逻辑：如果 API 返回的片名在本地已经有了，就不要了
-        const localTitles = new Set(localList.map((v) => v.title))
-
-        for (const item of apiList) {
-          if (!localTitles.has(item.title)) {
-            localList.push(item)
-          }
-        }
-      } catch (err) {
-        // API 搜不到也没关系，至少有本地的
-        console.log("API 补充搜索失败或无结果")
-      }
+    // 1. 关键词搜索 (支持 片名、演员、导演)
+    if (wd) {
+      const regex = new RegExp(wd, "i"); // 忽略大小写
+      query.$or = [
+        { title: regex },
+        { actors: regex },
+        { director: regex }
+      ];
     }
 
+    // 2. 分类筛选
+    if (t) {
+      query.type_id = parseInt(t);
+    }
+
+    // 3. 年份筛选
+    if (year && year !== "全部") {
+      query.year = String(year);
+    }
+
+    // 4. 排序逻辑
+    let sort = { updatedAt: -1 }; // 默认按采集时间倒序
+    if (by === "score") sort = { rating: -1 };
+    if (by === "year") sort = { year: -1 };
+
+    // -------------------------------------------------
+    // 第二步：查询本地数据库
+    // -------------------------------------------------
+    const [localList, localTotal] = await Promise.all([
+      Video.find(query)
+        .select("id title poster type year rating remarks type_id actors") // 只取需要的字段
+        .sort(sort)
+        .skip(skip)
+        .limit(limit)
+        .lean(), // 转为纯 JSON 对象
+      Video.countDocuments(query)
+    ]);
+
+    // 标记来源
+    let finalList = localList.map(v => ({ ...v, source: "Local" }));
+    let finalTotal = localTotal;
+    let finalSource = "Local Database";
+    let finalLatency = 0;
+
+    // -------------------------------------------------
+    // 第三步：判断是否需要“回源互补” (Hybrid Search)
+    // -------------------------------------------------
+    // 触发条件：
+    // 1. 是搜索模式 (wd 存在) 且 本地结果少于 5 条 (可能是新片本地没采到)
+    // 2. 是分类/首页模式 (无 wd) 且 本地完全没数据 (数据库是空的)
+    // 3. 仅在第 1 页触发 (分页太深不适合混合)
+    const needRemote = (wd && localList.length < 5) || (!wd && localList.length === 0);
+
+    if (page === 1 && needRemote) {
+      console.log(`[Hybrid] 本地结果不足 (${localList.length}条)，触发远程搜索...`);
+      
+      try {
+        const fetchOptions = fixedSource ? fixedSource : null;
+        
+        // 调用智能请求 (smartFetch)
+        // 构造远程参数
+        const remoteParamsFn = (source) => {
+          const p = { ac: "detail", at: "json", pg: 1 };
+          if (wd) p.wd = wd; // 远程只支持搜名称
+          // 注意：远程 API 不支持搜演员，所以这里其实是去补全"片名匹配"的数据
+          if (t) p.t = source.id_map && source.id_map[t] ? source.id_map[t] : t;
+          if (h) p.h = h;
+          return p;
+        };
+
+        const remoteResult = await smartFetch(remoteParamsFn, fetchOptions);
+        
+        if (remoteResult && remoteResult.data && remoteResult.data.list) {
+          finalSource = `Hybrid (Local + ${remoteResult.sourceName})`;
+          finalLatency = remoteResult.duration;
+
+          // 处理远程数据
+          const remoteListRaw = remoteResult.data.list;
+          const remoteListProcessed = [];
+
+          // 遍历远程数据：清洗 + 自动入库 + 合并
+          for (const item of remoteListRaw) {
+            // 构造入库对象
+            const videoData = {
+              id: `${remoteResult.sourceKey}$${item.vod_id}`,
+              title: item.vod_name,
+              type_id: parseInt(item.type_id) || 0,
+              type: item.type_name,
+              poster: item.vod_pic,
+              remarks: item.vod_remarks,
+              year: item.vod_year,
+              rating: parseFloat(item.vod_score) || 0,
+              date: item.vod_time,
+              actors: item.vod_actor || "",
+              director: item.vod_director || "",
+              overview: (item.vod_content || "").replace(/<[^>]+>/g, "").trim(),
+              vod_play_from: item.vod_play_from,
+              vod_play_url: item.vod_play_url,
+              updatedAt: new Date()
+            };
+
+            // 🔥 异步存入 MongoDB (懒加载：用户搜了才存)
+            Video.updateOne({ id: videoData.id }, { $set: videoData }, { upsert: true })
+              .catch(err => console.error("Hybrid Auto-Save fail:", err.message));
+
+            // 格式化为前端需要的结构
+            const displayItem = {
+              id: videoData.id,
+              title: videoData.title,
+              type: videoData.type,
+              poster: videoData.poster,
+              remarks: videoData.remarks,
+              year: parseInt(videoData.year) || 0,
+              rating: videoData.rating,
+              date: videoData.date,
+              actors: videoData.actors,
+              director: videoData.director,
+              source: "Remote"
+            };
+
+            remoteListProcessed.push(displayItem);
+          }
+
+          // 合并逻辑：本地数据在钱，远程数据在后，去重
+          const existingTitles = new Set(finalList.map(v => v.title));
+          for (const rItem of remoteListProcessed) {
+            // 简单的去重策略：如果片名完全一样，以本地为准 (本地索引优)
+            // 或者：如果 ID 一样 (肯定要去重)
+            const isDuplicateId = finalList.some(l => l.id === rItem.id);
+            if (!isDuplicateId && !existingTitles.has(rItem.title)) {
+              finalList.push(rItem);
+            }
+          }
+
+          // 更新总数 (估算)
+          finalTotal = localTotal + (remoteResult.data.total || 0);
+        }
+      } catch (err) {
+        console.warn("[Hybrid] 远程补充失败，仅返回本地数据", err.message);
+      }
+    } else if (localTotal === 0 && page > 1) {
+      // 极端情况：翻页了，本地没数据，用户非要看后面的页 (通常发生于没采集完)
+      // 可以选择返回空，或者强制去远程翻页 (逻辑较复杂，建议引导用户去搜具体的)
+    }
+
+    // -------------------------------------------------
+    // 第四步：返回结果
+    // -------------------------------------------------
     success(res, {
-      list: localList,
-      total: localList.length,
-      source: "Hybrid (Local + API)",
-    })
+      list: finalList,
+      total: finalTotal > 0 ? finalTotal : finalList.length,
+      page: page,
+      pagecount: Math.ceil((finalTotal || finalList.length) / limit),
+      source: finalSource,
+      latency: finalLatency
+    });
+
   } catch (e) {
-    fail(res, "搜索出错")
+    console.error("API Videos Error:", e);
+    fail(res, "数据查询失败");
   }
-})
+});
 
 // [本地增强搜索] - 支持搜片名和演员
 app.get("/api/local/search", async (req, res) => {
@@ -852,18 +1029,18 @@ app.post("/api/auth/login", async (req, res) => {
 })
 
 // server.js 顶部引入
-const cron = require("node-cron")
-const { startSync } = require("./scripts/sync") // 把 sync.js 封装成函数导出
+// const cron = require("node-cron")
+// const { startSync } = require("./scripts/sync") // 把 sync.js 封装成函数导出
 
 // ... 你的其他路由代码 ...
 
 // ⏰ 定时任务：每天凌晨 2:00 执行采集
 // 格式：分 时 日 月 周
-cron.schedule("0 2 * * *", () => {
-  console.log("⏰ 定时任务启动：开始同步数据...")
-  // 调用你的采集函数
-  startSync().catch((err) => console.error("同步失败:", err))
-})
+// cron.schedule("0 2 * * *", () => {
+//   console.log("⏰ 定时任务启动：开始同步数据...")
+//   // 调用你的采集函数
+//   startSync().catch((err) => console.error("同步失败:", err))
+// })
 
 app.use((err, req, res, next) => {
   console.error("Global Error:", err)
