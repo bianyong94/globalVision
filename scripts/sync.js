@@ -36,7 +36,7 @@ const formatVideo = (item, sourceKey) => {
 }
 
 // hours = 0 代表采集所有历史数据
-async function syncSource(sourceKey, hours = 0,startPage = 1) {
+async function syncSource(sourceKey, hours = 0, startPage = 1) {
   const source = sources[sourceKey]
   if (!source) return
 
@@ -64,7 +64,7 @@ async function syncSource(sourceKey, hours = 0,startPage = 1) {
         params.h = hours
       }
 
-      console.log(`   📡 正在请求第 ${page} 页...`)
+      console.log(`   📡 正在请求第 ${page} 页..`)
 
       // 请求数据 (超时时间设长一点)
       const res = await axios.get(url, { params, timeout: 60000 })
