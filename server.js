@@ -732,15 +732,15 @@ app.delete("/api/user/history", async (req, res) => {
 })
 
 // 启动采集任务
-const runSyncTask = () => {
-  console.log(`📅 [Sync] 触发全量采集...`)
-  const syncProcess = exec("node scripts/sync.js")
-  syncProcess.stdout.on("data", (d) => console.log(`[Sync] ${d.trim()}`))
-}
+// const runSyncTask = () => {
+//   console.log(`📅 [Sync] 触发全量采集...`)
+//   const syncProcess = exec("node scripts/sync.js")
+//   syncProcess.stdout.on("data", (d) => console.log(`[Sync] ${d.trim()}`))
+// }
 
-if (process.env.NODE_ENV === "production") {
-  setTimeout(runSyncTask, 5000)
-}
+// if (process.env.NODE_ENV === "production") {
+//   setTimeout(runSyncTask, 5000)
+// }
 
 // 错误处理
 app.use((err, req, res, next) => {
