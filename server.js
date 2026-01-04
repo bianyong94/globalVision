@@ -18,6 +18,7 @@ const { exec } = require("child_process")
 const { sources, PRIORITY_LIST } = require("./config/sources")
 
 const app = express()
+app.set("trust proxy", 1)
 const PORT = process.env.PORT || 3000
 
 // ==========================================
