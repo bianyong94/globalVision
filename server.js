@@ -57,16 +57,39 @@ const AI_API_URL = "https://api.siliconflow.cn/v1/chat/completions"
 const localCache = new NodeCache({ stdTTL: 600, checkperiod: 120 })
 let redisClient = null
 
-if (process.env.REDIS_CONNECTION_STRING) {
-  redisClient = new Redis(process.env.REDIS_CONNECTION_STRING)
-  redisClient.on("connect", () => console.log("✅ Redis Cache Connected"))
-  redisClient.on("error", (err) => {
-    console.error("❌ Redis Error (Falling back to memory):", err.message)
-  })
-} else {
-  console.log("⚠️ No Redis Config found, using Memory Cache")
-}
+// 🛡️ 增加 try-catch 保护，防止 Redis 连接字符串格式错误导致程序闪退
+try {
+  if (process.env.REDIS_CONNECTION_STRING) {
+    // 打印前几个字符检查是否读取到了变量 (不要打印全部，防止泄露密码)
+    console.log(
+      "尝试连接 Redis...",
+      process.env.REDIS_CONNECTION_STRING.substring(0, 10) + "..."
+    )
 
+    redisClient = new Redis(process.env.REDIS_CONNECTION_STRING, {
+      // 增加连接重试策略，防止连不上一直卡死或报错
+      retryStrategy: (times) => {
+        const delay = Math.min(times * 50, 2000)
+        return delay
+      },
+      maxRetriesPerRequest: 3,
+    })
+
+    redisClient.on("connect", () => console.log("✅ Redis Cache Connected"))
+    redisClient.on("error", (err) => {
+      // 只打印错误消息，不中断进程
+      console.error("❌ Redis Error (Using Memory Cache):", err.message)
+      // 如果连接失败，将 client 置空，后续代码会自动降级到内存缓存
+      // redisClient = null; // 可选：如果希望不断重试则不置空
+    })
+  } else {
+    console.log("⚠️ No Redis Config found, using Memory Cache")
+  }
+} catch (error) {
+  console.error("🔥 Redis Init Critical Error:", error.message)
+  console.log("⚠️ Falling back to Memory Cache due to Redis config error")
+  redisClient = null
+}
 const getCache = async (key) => {
   try {
     if (redisClient) {
