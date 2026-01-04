@@ -44,17 +44,7 @@ const DB_QUERY_MAPPING = {
 }
 
 // 3. 垃圾分类黑名单
-const BLACK_LIST = [
-  "伦理",
-  "福利",
-  "激情",
-  "论理",
-  "测试",
-  "留言",
-  "公告",
-  "资讯",
-  "全部影片",
-]
+const BLACK_LIST = ["测试", "留言", "公告", "资讯", "全部影片"]
 
 // 4. AI 配置
 const AI_API_KEY = process.env.AI_API_KEY
