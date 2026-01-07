@@ -1,3 +1,5 @@
+console.log("🔥 Application Starting...")
+
 // server.js - 终极版 (混合搜索 + 智能分类清洗 + Redis缓存 + 首页熔断保护)
 require("dotenv").config()
 const express = require("express")
@@ -164,7 +166,11 @@ if (MONGO_URI) {
       // 1. 先启动 HTTP 服务，确保网站立刻能访问
 
       // 2. 部署后自动触发采集 (后台运行)
-      runStartupTask()
+      // ✅ 修改后的写法：延迟 10 秒执行，优先保证 Web 服务存活
+      setTimeout(() => {
+        console.log("⏰ 延迟启动采集任务，防止阻塞启动...")
+        runStartupTask()
+      }, 10000)
     })
     .catch((err) => console.error("❌ MongoDB Connection Error:", err))
 }
