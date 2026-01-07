@@ -503,7 +503,7 @@ app.get("/api/v2/videos", async (req, res) => {
     }
 
     // 4️⃣ 排序逻辑
-    let sortObj = { updatedAt: -1 } // 默认按更新时间倒序
+    let sortObj = { year: -1 } // 默认按更新时间倒序
 
     // 智能排序劫持
     if (sort === "rating" || tag === "high_score" || tag === "douban_top") {
@@ -514,6 +514,9 @@ app.get("/api/v2/videos", async (req, res) => {
       }
     } else if (sort === "year") {
       sortObj = { year: -1 }
+    } else if (sort === "time") {
+      // 显式传 time 时，也走这个逻辑
+      sortObj = { date: -1, year: -1 }
     }
 
     // 5️⃣ 执行查询

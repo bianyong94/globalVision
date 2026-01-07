@@ -1,90 +1,142 @@
+// scripts/force_refresh_tags.js
+console.log("1. 脚本开始执行...")
+
 require("dotenv").config()
 const mongoose = require("mongoose")
-const Video = require("../models/Video")
+const Video = require("../models/Video") // 确保路径对
 const { classifyVideo } = require("../utils/classifier")
 
+const BATCH_SIZE = 2000
+
 const run = async () => {
-  console.log("🚀 开始全量刷新视频标签 (基于最新的 classifier 规则)...")
+  console.log("4. 数据库连接成功！准备查询数据...")
 
-  // 1. 查找所有视频 (使用 cursor 游标防止内存溢出)
-  // 只查询必要的字段以提高速度
-  const cursor = Video.find({}).cursor()
+  try {
+    // 先检查一下有多少数据
+    const totalCount = await Video.countDocuments({})
+    console.log(`📊 数据库中共有 ${totalCount} 条视频。`)
 
-  let count = 0
-  let updatedCount = 0
-
-  for (let doc = await cursor.next(); doc != null; doc = await cursor.next()) {
-    count++
-
-    // 2. 构造模拟的采集项 (还原 classifyVideo 需要的输入格式)
-    // ⚠️ 注意：这里使用数据库里的 original_type 和 title 重新进行判断
-    const mockItem = {
-      type_id: 1, // 给个默认ID防止报错，主要靠 type_name 判断
-      type_name: doc.original_type || "",
-      vod_name: doc.title,
-      vod_content: doc.overview || "", // 简介也参与判断
-      vod_remarks: doc.remarks,
-      vod_area: doc.area,
-      vod_year: doc.year,
-      vod_score: doc.rating,
+    if (totalCount === 0) {
+      console.log("⚠️ 数据库是空的，脚本结束。")
+      return
     }
 
-    // 3. 使用最新的规则重新计算
-    const result = classifyVideo(mockItem)
+    console.log("5. 开始创建游标 (Cursor)...")
+    const cursor = Video.find(
+      {},
+      {
+        _id: 1,
+        title: 1,
+        original_type: 1,
+        overview: 1,
+        remarks: 1,
+        area: 1,
+        year: 1,
+        rating: 1,
+        tags: 1,
+        category: 1,
+      }
+    )
+      .lean()
+      .cursor()
 
-    if (result && result.tags) {
-      // 4. 比较新旧标签，只有变动了才保存 (优化性能)
+    let totalScanned = 0
+    let bulkOps = []
+    let updatedCount = 0
+
+    console.log("6. 进入循环处理...")
+
+    for (
+      let doc = await cursor.next();
+      doc != null;
+      doc = await cursor.next()
+    ) {
+      totalScanned++
+
+      // 每扫描 100 条打印一次，证明脚本还活着
+      if (totalScanned % 1000 === 0) {
+        process.stdout.write(`\r👀 正在扫描第 ${totalScanned} 条...`)
+      }
+
+      const mockItem = {
+        type_id: 1,
+        type_name: doc.original_type || "",
+        vod_name: doc.title,
+        vod_content: doc.overview || "",
+        vod_remarks: doc.remarks,
+        vod_area: doc.area,
+        vod_year: doc.year,
+        vod_score: doc.rating,
+      }
+
+      const result = classifyVideo(mockItem)
+
+      if (!result) continue
+
       const oldTags = doc.tags || []
       const newTags = result.tags
+      const oldCategory = doc.category
+      const newCategory = result.category
 
-      // 简单的去重合并逻辑：保留原有的 high_score 等特殊标签，合并新计算出的类型标签
-      // 或者直接覆盖？为了保证准确性，建议直接覆盖分类标签，但保留高分标签
-      // 这里为了稳妥，我们直接用新算出来的标签覆盖 (因为新规则包含了所有逻辑)
-
-      // 检查是否发生变化
-      const isDifferent =
+      const isTagsChanged =
         oldTags.length !== newTags.length ||
         !oldTags.every((t) => newTags.includes(t))
+      const isCategoryChanged = oldCategory !== newCategory
 
-      if (isDifferent) {
-        doc.tags = newTags
-        // 如果你需要同时纠正分类 (比如把之前分错的纠正过来)，把下面这行注释打开
-        // doc.category = result.category;
-
-        await doc.save()
+      if (isTagsChanged || isCategoryChanged) {
+        bulkOps.push({
+          updateOne: {
+            filter: { _id: doc._id },
+            update: { $set: { tags: newTags, category: newCategory } },
+          },
+        })
         updatedCount++
-        process.stdout.write(
-          `\r✅ 已扫描: ${count} | 已更新: ${updatedCount} | 最新更新: ${
-            doc.title
-          } -> [${newTags.join(",")}]`
-        )
+      }
+
+      if (bulkOps.length >= BATCH_SIZE) {
+        process.stdout.write(`\n⚡ 正在写入 ${bulkOps.length} 条数据...`)
+        await Video.bulkWrite(bulkOps)
+        console.log(` -> 写入成功 (累计更新: ${updatedCount})`)
+        bulkOps = []
+        if (global.gc) global.gc()
       }
     }
 
-    if (count % 1000 === 0) {
-      // 防止内存泄露
-      if (global.gc) global.gc()
+    if (bulkOps.length > 0) {
+      console.log(`\n⚡ 写入剩余的 ${bulkOps.length} 条数据...`)
+      await Video.bulkWrite(bulkOps)
     }
+
+    console.log(`\n🎉 全部完成！扫描: ${totalScanned} | 更新: ${updatedCount}`)
+  } catch (err) {
+    console.error("\n❌ 脚本运行出错:", err)
   }
-
-  console.log(`\n\n🎉 刷新完成！`)
-  console.log(`总扫描: ${count}`)
-  console.log(`实际更新: ${updatedCount}`)
 }
 
+// --- 连接逻辑 ---
 const MONGO_URI = process.env.MONGO_URI
+console.log("2. 检查环境变量...")
+
 if (!MONGO_URI) {
-  console.error("❌ MONGO_URI missing")
+  console.error("❌ 错误: 未找到 MONGO_URI，请检查 .env 文件")
   process.exit(1)
+} else {
+  // 只打印前几位，防止泄露密码
+  console.log(`✅ 找到连接字符串: ${MONGO_URI.substring(0, 15)}...`)
 }
 
+console.log("3. 正在连接 MongoDB (如果卡在这里超过 10秒，请检查 IP 白名单)...")
+
+// 设置连接超时 10秒
 mongoose
-  .connect(MONGO_URI)
+  .connect(MONGO_URI, { serverSelectionTimeoutMS: 10000 })
   .then(async () => {
     await run()
+    console.log("👋 脚本退出")
     process.exit(0)
   })
   .catch((e) => {
-    console.error(e)
+    console.error("\n❌ 数据库连接失败！原因如下：")
+    console.error(e.message)
     process.exit(1)
   })
