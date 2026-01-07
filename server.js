@@ -155,10 +155,50 @@ const httpsAgent = new https.Agent({
 
 const MONGO_URI = process.env.MONGO_URI
 if (MONGO_URI) {
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Server running on port ${PORT}`)
+  })
   mongoose
     .connect(MONGO_URI)
-    .then(() => console.log("✅ MongoDB Database Connected"))
+    .then(() => {
+      // 1. 先启动 HTTP 服务，确保网站立刻能访问
+
+      // 2. 部署后自动触发采集 (后台运行)
+      runStartupTask()
+    })
     .catch((err) => console.error("❌ MongoDB Connection Error:", err))
+}
+// ==========================================
+// 🛠️ 辅助函数：启动任务逻辑
+// ==========================================
+async function runStartupTask() {
+  // 判断是否是生产环境 (防止你在本地开发时每次保存代码都疯狂采集)
+  // 如果你想本地也跑，可以去掉这个 if 判断
+  if (
+    process.env.NODE_ENV === "production" ||
+    process.env.FORCE_SYNC === "true"
+  ) {
+    console.log("✨ 部署/启动检测通过，准备执行初始化采集...")
+
+    // 策略 A: 每次重启只采集最近 24 小时 (增量更新，速度快)
+    // 适合日常部署维护
+    const hours = 24
+
+    // 策略 B: 如果你想初次部署跑全量，可以通过环境变量控制
+    // 在宝塔/Docker 设置环境变量 INITIAL_FULL_SYNC=true
+    if (process.env.INITIAL_FULL_SYNC === "true") {
+      console.log("⚠️ 检测到全量同步标记，开始采集所有历史数据...")
+      // 采集 99999 小时相当于全量
+      syncTask(99999).catch((e) => console.error("全量采集出错:", e))
+    } else {
+      console.log("🔄 开始执行启动增量同步 (24h)...")
+      syncTask(hours).catch((e) => console.error("增量采集出错:", e))
+    }
+  } else {
+    console.log(
+      "👨‍💻 开发环境：跳过自动采集 (如需测试请在 .env 添加 FORCE_SYNC=true)"
+    )
+  }
 }
 
 const UserSchema = new mongoose.Schema({
