@@ -52,7 +52,14 @@ const VideoSchema = new mongoose.Schema(
 )
 
 // 复合文本索引 (用于全文搜索)
-VideoSchema.index({ title: "text", actors: "text", original_type: "text" })
+VideoSchema.index(
+  { title: "text", actors: "text", original_type: "text" },
+  {
+    // 👇 关键：指定一个不存在的字段名，或者是 "none"
+    // 这样 MongoDB 就不会去读取你的 'language' 字段了
+    language_override: "dummy_language_field",
+  }
+)
 // 复合查询索引 (用于类似 "找美剧+悬疑+按时间排序" 的查询)
 VideoSchema.index({ category: 1, tags: 1, updatedAt: -1 })
 
