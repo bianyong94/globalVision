@@ -55,7 +55,7 @@ const transformData = (item) => {
 const syncTask = async (hours = 24) => {
   console.log(`🚀 [${new Date().toISOString()}] Start Syncing ${SOURCE_KEY}...`)
 
-  let page = 1
+  let page = 3200
   let totalPage = 1
   let processedCount = 0
   let errorCount = 0 // 连续错误计数
