@@ -13,6 +13,8 @@ const { HttpsProxyAgent } = require("https-proxy-agent")
 const Redis = require("ioredis")
 const Video = require("./models/Video") // 确保 ./models/Video.js 存在
 const { exec } = require("child_process")
+const { syncTask } = require("./scripts/sync")
+const cron = require("node-cron")
 
 // 引入源配置
 const { sources, PRIORITY_LIST } = require("./config/sources")
@@ -209,42 +211,36 @@ const smartFetch = async (paramsFn, options = null) => {
   if (specificSourceKey) {
     targetKeys = [specificSourceKey]
   } else {
-    const healthyKeys = PRIORITY_LIST.filter(
+    // 取前3个健康的源
+    targetKeys = PRIORITY_LIST.filter(
       (key) => sourceHealth[key].deadUntil <= Date.now()
-    )
-    targetKeys = scanAll ? healthyKeys : healthyKeys.slice(0, 3)
+    ).slice(0, 3)
   }
 
   if (targetKeys.length === 0) targetKeys = [PRIORITY_LIST[0]]
 
   const requests = targetKeys.map(async (key) => {
     const source = sources[key]
-    if (!source) throw new Error("Config missing")
-
     try {
       const params = paramsFn(source)
       const startTime = Date.now()
+      // 设置更短的超时，快速失败
       const response = await axios.get(source.url, {
         params,
         ...getAxiosConfig(),
+        timeout: 3000, // 缩短超时时间到3秒
       })
-      const duration = Date.now() - startTime
 
-      if (
-        response.data &&
-        response.data.list &&
-        response.data.list.length > 0
-      ) {
+      if (response.data?.list?.length > 0) {
         markSourceSuccess(key)
         return {
           data: response.data,
           sourceName: source.name,
           sourceKey: key,
-          duration: duration,
+          duration: Date.now() - startTime,
         }
-      } else {
-        throw new Error("Empty Data")
       }
+      throw new Error("Empty Data")
     } catch (err) {
       if (!specificSourceKey) markSourceFailed(key)
       throw err
@@ -409,6 +405,43 @@ app.get("/api/videos", async (req, res) => {
   }
 })
 
+// v2. 筛选页接口 (Filter)
+// 前端调用: /api/v2/videos?cat=tv&tag=悬疑&area=韩国&sort=rating
+app.get("/api/v2/videos", async (req, res) => {
+  try {
+    const { cat, tag, area, year, sort, pg = 1 } = req.query
+    const limit = 20
+    const skip = (pg - 1) * limit
+
+    const query = {}
+    if (cat) query.category = cat // movie, tv, anime...
+
+    // 标签筛选 (支持多个)
+    if (tag) {
+      // 如果传了 "悬疑", MongoDB 会自动在 tags 数组里找
+      query.tags = tag
+    }
+
+    if (area) query.area = new RegExp(area)
+    if (year) query.year = parseInt(year)
+
+    // 排序逻辑
+    let sortObj = { updatedAt: -1 } // 默认按更新时间
+    if (sort === "rating") sortObj = { rating: -1 }
+    if (sort === "year") sortObj = { year: -1 }
+
+    const list = await Video.find(query)
+      .sort(sortObj)
+      .skip(skip)
+      .limit(limit)
+      .select("title poster remarks rating year tags")
+
+    res.json({ code: 200, list })
+  } catch (e) {
+    res.status(500).json({ code: 500, msg: "Error" })
+  }
+})
+
 // [接口 2] 首页 Trending (修复版：带容错保护)
 app.get("/api/home/trending", async (req, res) => {
   const cacheKey = "home_dashboard_v11_safe"
@@ -503,6 +536,60 @@ app.get("/api/home/trending", async (req, res) => {
   }
 })
 
+// v2. 首页“精装修”接口 (对应你截图的布局)
+app.get("/api/v2/home", async (req, res) => {
+  try {
+    // 并行查询，速度极快
+    const [banners, netflix, shortDrama, highRateTv, newMovies] =
+      await Promise.all([
+        // 轮播图：取最近更新的 4K 电影或 Netflix 剧集
+        Video.find({ tags: { $in: ["netflix", "4k"] }, category: "movie" })
+          .sort({ updatedAt: -1 })
+          .limit(5)
+          .select("title poster tags remarks id"),
+
+        // Section 1: Netflix 独家 (剧集)
+        Video.find({ tags: "netflix", category: "tv" })
+          .sort({ updatedAt: -1 })
+          .limit(10)
+          .select("title poster remarks"),
+
+        // Section 2: 热门短剧 (专门筛选 miniseries 标签)
+        Video.find({ tags: "miniseries" })
+          .sort({ updatedAt: -1 })
+          .limit(10)
+          .select("title poster remarks"),
+
+        // Section 3: 高分美剧 (分类+标签+评分排序)
+        Video.find({ tags: "欧美", category: "tv", rating: { $gt: 0 } })
+          .sort({ rating: -1 })
+          .limit(10)
+          .select("title poster rating"),
+
+        // Section 4: 院线新片
+        Video.find({ category: "movie", tags: "new_arrival" })
+          .sort({ updatedAt: -1 })
+          .limit(12)
+          .select("title poster remarks"),
+      ])
+
+    res.json({
+      code: 200,
+      data: {
+        banners,
+        sections: [
+          { title: "Netflix 精选", type: "scroll", data: netflix },
+          { title: "爆火短剧", type: "grid", data: shortDrama },
+          { title: "口碑美剧", type: "grid", data: highRateTv },
+          { title: "院线新片", type: "grid", data: newMovies },
+        ],
+      },
+    })
+  } catch (e) {
+    res.status(500).json({ code: 500, msg: e.message })
+  }
+})
+
 // [接口 3] 分类列表 (自动正则清洗)
 app.get("/api/categories", async (req, res) => {
   const cacheKey = "categories_auto_washed_v2"
@@ -569,7 +656,10 @@ app.get("/api/categories", async (req, res) => {
 // [接口 4] 详情 (每次必回源 + 更新数据库)
 app.get("/api/detail/:id", async (req, res) => {
   const { id } = req.params
-
+  // 1️⃣ 先查缓存 (缓存 10 分钟)
+  const cacheKey = `detail_${id}`
+  const cachedData = await getCache(cacheKey)
+  if (cachedData) return success(res, cachedData)
   const parseEpisodes = (urlStr, fromStr) => {
     if (!urlStr) return []
     const froms = (fromStr || "").split("$$$")
@@ -612,14 +702,18 @@ app.get("/api/detail/:id", async (req, res) => {
 
     const detail = result.data.list[0]
     const savedData = await saveToDB(detail, sourceKey)
-
-    success(res, {
+    const responseData = {
       ...savedData,
       area: detail.vod_area,
       episodes: parseEpisodes(detail.vod_play_url, detail.vod_play_from),
       source: result.sourceName,
       latency: result.duration,
-    })
+    }
+
+    // 2️⃣ 写入缓存
+    await setCache(cacheKey, responseData, 600)
+
+    success(res, responseData)
   } catch (e) {
     console.error("Detail Error:", e.message)
     fail(res, "获取详情失败")
@@ -765,7 +859,9 @@ app.delete("/api/user/history", async (req, res) => {
 // if (process.env.NODE_ENV === "production") {
 //   setTimeout(runSyncTask, 5000)
 // }
-
+cron.schedule("0 */2 * * *", () => {
+  syncTask(3) // 采集最近3小时的变动
+})
 // 错误处理
 app.use((err, req, res, next) => {
   console.error("Global Error:", err)
