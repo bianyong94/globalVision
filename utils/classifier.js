@@ -1,9 +1,31 @@
 // utils/classifier.js
 
 /**
- * 🧹 智能分类与打标系统
- * 目标：将杂乱的资源站数据清洗为标准化的 Netflix 风格数据
+ * 🧹 智能分类与打标系统 (增强版)
+ * 1. 强力屏蔽成人/违规内容
+ * 2. 修复分类不准的问题
  */
+
+// 🚫 黑名单关键词 (出现这些词直接丢弃)
+const BLACKLIST = [
+  "解说",
+  "写真",
+  "只有神",
+  "av",
+  "AV",
+  "色情",
+  "露点",
+  "激情",
+  "成人",
+  "R级",
+  "情色",
+  "测试",
+  "公告",
+]
+
+// 🚫 黑名单分类ID (有些源站会把伦理片放在特定ID，如 20, 30, 34 等，需根据源站实际情况调整)
+// 茅台资源通常 ID 34 是伦理片
+const BLOCK_TYPE_IDS = [34, 35, 40, 41]
 
 const classifyVideo = (item) => {
   const typeId = parseInt(item.type_id)
@@ -14,12 +36,28 @@ const classifyVideo = (item) => {
   const area = item.vod_area || ""
   const year = parseInt(item.vod_year) || 0
 
-  // 1️⃣ 确定标准大类 (Category)
-  // 逻辑：ID优先，正则兜底，防止漏网之鱼
-  let category = "other" // 默认为其他
+  // ===============================================
+  // 🛑 1. 熔断机制：黑名单检查
+  // ===============================================
 
-  // 动漫 (优先级最高，防止 "国产动漫" 被归为 "国产剧")
-  if ([4].includes(typeId) || /动漫|动画|国漫/.test(typeName)) {
+  // 检查 ID 是否在屏蔽列表
+  if (BLOCK_TYPE_IDS.includes(typeId)) return null
+
+  // 检查 标题/分类/简介 是否包含黑名单词汇
+  const combinedText = `${typeName} ${name}`.toLowerCase() // 简介容易误杀，暂时只查标题和分类
+  if (
+    BLACKLIST.some((keyword) => combinedText.includes(keyword.toLowerCase()))
+  ) {
+    return null // 返回 null 表示这条数据直接丢弃
+  }
+
+  // ===============================================
+  // 🏷️ 2. 确定标准大类 (Category)
+  // ===============================================
+  let category = "other"
+
+  // 动漫
+  if ([4].includes(typeId) || /动漫|动画/.test(typeName)) {
     category = "anime"
   }
   // 综艺
@@ -30,15 +68,14 @@ const classifyVideo = (item) => {
   else if (/体育|赛事|NBA|足球|篮球/.test(typeName)) {
     category = "sports"
   }
-  // 纪录片
-  else if (/纪录|记录/.test(typeName)) {
-    category = "doc"
-  }
-  // 剧集 (包含 短剧)
-  else if ([2, 13, 14, 15, 16].includes(typeId) || /剧/.test(typeName)) {
+  // 剧集 (严防把“伦理剧”归进来)
+  else if (
+    [2, 13, 14, 15, 16].includes(typeId) ||
+    (/剧/.test(typeName) && !/伦理/.test(typeName))
+  ) {
     category = "tv"
   }
-  // 电影 (剩下的通常是电影)
+  // 电影 (严防把“福利片”归进来)
   else if (
     [1, 6, 7, 8, 9, 10, 11, 12].includes(typeId) ||
     /片|电影/.test(typeName)
@@ -46,39 +83,35 @@ const classifyVideo = (item) => {
     category = "movie"
   }
 
-  // 2️⃣ 生成智能标签 (Tags)
-  let tags = new Set() // 使用 Set 自动去重
+  // 如果经过一轮筛选还是 other，且 type_id 很大，极有可能是杂乱资源，建议直接丢弃
+  if (category === "other" && typeId > 50) return null
 
-  // --- A. 平台/厂牌标签 (精装修的关键) ---
+  // ===============================================
+  // 🏷️ 3. 生成智能标签 (Tags)
+  // ===============================================
+  let tags = new Set()
+
+  // --- A. 平台/厂牌 ---
   if (/Netflix|网飞/i.test(name) || /Netflix|网飞/i.test(content))
     tags.add("netflix")
-  if (/HBO/.test(name) || /HBO/.test(content)) tags.add("hbo")
-  if (/Disney|迪士尼/i.test(name)) tags.add("disney")
-  if (/Apple/.test(name) || /Apple/.test(content)) tags.add("apple_tv")
-  if (/B站|哔哩哔哩/.test(name) || /哔哩哔哩/.test(content))
-    tags.add("bilibili")
-  if (/腾讯视频/.test(content)) tags.add("tencent")
-  if (/爱奇艺/.test(content)) tags.add("iqiyi")
+  if (/HBO/.test(name)) tags.add("hbo")
+  if (/Disney/.test(name)) tags.add("disney")
+  if (/B站|哔哩哔哩/.test(name)) tags.add("bilibili")
 
-  // --- B. 格式/画质标签 ---
+  // --- B. 画质 ---
   if (/4K|2160P/i.test(name) || /4K/i.test(remarks)) tags.add("4k")
-  else if (/1080P/i.test(name) || /1080P/i.test(remarks)) tags.add("1080p")
-  if (/60帧|60FPS/i.test(name)) tags.add("60fps")
-  if (/中字|双语/.test(name)) tags.add("subtitled") // 内嵌字幕
+  else if (/1080P/i.test(name)) tags.add("1080p")
 
-  // --- C. 题材/类型标签 (从 type_name 和 name 中提取) ---
+  // --- C. 类型 ---
   const genreMap = {
     动作: /动作|格斗|武侠|特工/,
-    喜剧: /喜剧|搞笑|相声/,
-    爱情: /爱情|恋爱|浪漫|甜宠/,
+    喜剧: /喜剧|搞笑/,
+    爱情: /爱情|恋爱|甜宠/,
     科幻: /科幻|太空|未来/,
     恐怖: /恐怖|惊悚|灵异|丧尸/,
-    犯罪: /犯罪|警匪|黑帮|破案/,
     悬疑: /悬疑|推理|探案/,
-    战争: /战争|军旅|抗日/,
-    古装: /古装|宫廷|穿越|仙侠|武侠/,
-    奇幻: /奇幻|魔幻|神话/,
-    灾难: /灾难|末日/,
+    战争: /战争|抗日/,
+    古装: /古装|宫廷|仙侠/,
     短剧: /短剧|短视频/,
   }
 
@@ -88,34 +121,38 @@ const classifyVideo = (item) => {
     }
   }
 
-  // --- D. 地区标签 ---
+  // --- D. 地区 ---
   if (/大陆|内地|中国/.test(area)) tags.add("国产")
-  if (/香港/.test(area)) tags.add("港剧") // 或 港片
-  if (/台湾/.test(area)) tags.add("台剧")
+  if (/香港/.test(area)) tags.add("港剧")
   if (/美国|英国|欧美/.test(area)) tags.add("欧美")
-  if (/韩国/.test(area)) tags.add("韩剧") // 或 韩片
+  if (/韩国/.test(area)) tags.add("韩剧")
   if (/日本/.test(area)) tags.add("日剧")
 
-  // --- E. 时间/状态标签 ---
+  // --- E. 时间/状态 (修正：严防老片标新片) ---
   const currentYear = new Date().getFullYear()
-  if (year === currentYear) tags.add("new_arrival") // 今年新片
-  if (year === currentYear - 1) tags.add("last_year")
-  if (/完结|全\d+集/.test(remarks)) tags.add("finished") // 已完结
+  // 只有 2024/2025/2026 的片子，且必须是“电影”或“剧集”才打 new_arrival
+  if (
+    (year === currentYear || year === currentYear + 1) &&
+    (category === "movie" || category === "tv")
+  ) {
+    tags.add("new_arrival")
+  }
 
-  // --- F. 评分标签 (如果有评分数据) ---
+  if (/完结|全\d+集/.test(remarks)) tags.add("finished")
+
+  // --- F. 评分 ---
   const score = parseFloat(item.vod_score || 0)
-  if (score >= 8.0) tags.add("high_score") // 高分神作
+  if (score >= 8.0) tags.add("high_score")
 
-  // 3️⃣ 特殊修正
-  // 如果是“短剧”，虽然归类在 tv，但我们可以专门打个标方便前端单独提出来
+  // 特殊修正：短剧归类
   if (typeName.includes("短剧")) {
     category = "tv"
-    tags.add("miniseries") // 短剧专用标
+    tags.add("miniseries")
   }
 
   return {
     category,
-    tags: Array.from(tags), // 转回数组
+    tags: Array.from(tags),
   }
 }
 

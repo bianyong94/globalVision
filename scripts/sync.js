@@ -5,128 +5,134 @@ const axios = require("axios")
 const Video = require("../models/Video")
 const { classifyVideo } = require("../utils/classifier")
 
-// 茅台资源 JSON 接口 (确保是 json 结尾)
 const API_URL =
   "https://caiji.maotaizy.cc/api.php/provide/vod/from/mtm3u8/at/json/"
-const SOURCE_KEY = "maotai" // 源标识
+const SOURCE_KEY = "maotai"
 
-// 采集单页数据
 const fetchPage = async (pg, hours) => {
-  try {
-    const res = await axios.get(API_URL, {
-      params: {
-        ac: "detail",
-        h: hours, // 采集最近几小时
-        pg: pg,
-      },
-      timeout: 10000, // 防止卡死
-    })
-    return res.data
-  } catch (error) {
-    console.error(`❌ Page ${pg} fetch failed: ${error.message}`)
-    return null
-  }
+  // 设置更长的超时时间 15s
+  const res = await axios.get(API_URL, {
+    params: { ac: "detail", h: hours, pg: pg },
+    timeout: 15000,
+  })
+  return res.data
 }
 
-// 转换数据格式
 const transformData = (item) => {
-  const { category, tags } = classifyVideo(item)
+  const result = classifyVideo(item)
+
+  // 🛑 如果被黑名单拦截，返回 null
+  if (!result) return null
+
+  const { category, tags } = result
 
   return {
     uniq_id: `${SOURCE_KEY}_${item.vod_id}`,
     vod_id: item.vod_id,
     source: SOURCE_KEY,
-
     title: item.vod_name,
     director: item.vod_director,
     actors: item.vod_actor,
     original_type: item.type_name,
-
-    category: category, // ✅ 标准分类
-    tags: tags, // ✅ 智能标签
-
+    category: category,
+    tags: tags,
     poster: item.vod_pic,
     overview: (item.vod_content || "")
       .replace(/<[^>]+>/g, "")
       .substring(0, 500),
-    language: item.vod_lang,
+    language: item.vod_lang, // 如果之前改了 Schema，这里要注意字段名
     area: item.vod_area,
     year: parseInt(item.vod_year) || 0,
     date: item.vod_time,
     rating: parseFloat(item.vod_score) || 0,
     remarks: item.vod_remarks,
-
     vod_play_from: item.vod_play_from,
     vod_play_url: item.vod_play_url,
-
     updatedAt: new Date(),
   }
 }
 
-// 主任务
 const syncTask = async (hours = 24) => {
   console.log(`🚀 [${new Date().toISOString()}] Start Syncing ${SOURCE_KEY}...`)
 
   let page = 1
   let totalPage = 1
   let processedCount = 0
+  let errorCount = 0 // 连续错误计数
 
   do {
-    const data = await fetchPage(page, hours)
-    if (!data || !data.list || data.list.length === 0) break
+    try {
+      // 1. 请求数据
+      const data = await fetchPage(page, hours)
 
-    totalPage = data.pagecount
-
-    // 构造批量写入操作 (BulkWrite)
-    const operations = data.list.map((item) => {
-      const doc = transformData(item)
-      return {
-        updateOne: {
-          filter: { uniq_id: doc.uniq_id }, // 根据唯一ID查找
-          update: { $set: doc }, // 更新所有字段
-          upsert: true, // 不存在则插入
-        },
+      // 2. 检查数据有效性
+      if (!data || !data.list || data.list.length === 0) {
+        console.log(`⚠️ Page ${page} is empty or end of list.`)
+        break
       }
-    })
 
-    if (operations.length > 0) {
-      await Video.bulkWrite(operations)
-      processedCount += operations.length
-      console.log(
-        `✅ Page ${page}/${totalPage} processed (${operations.length} items)`
-      )
+      totalPage = data.pagecount
+
+      // 3. 数据清洗与转换
+      const operations = data.list
+        .map((item) => transformData(item)) // 清洗
+        .filter((item) => item !== null) // 过滤掉被屏蔽的 null
+        .map((doc) => ({
+          updateOne: {
+            filter: { uniq_id: doc.uniq_id },
+            update: { $set: doc },
+            upsert: true,
+          },
+        }))
+
+      // 4. 批量写入 (只有当有有效数据时才写入)
+      if (operations.length > 0) {
+        await Video.bulkWrite(operations)
+        processedCount += operations.length
+        console.log(
+          `✅ Page ${page}/${totalPage} saved (${operations.length} items).`
+        )
+      } else {
+        console.log(
+          `⚠️ Page ${page}/${totalPage} skipped (all items filtered).`
+        )
+      }
+
+      // 重置连续错误计数
+      errorCount = 0
+      page++
+    } catch (error) {
+      console.error(`❌ Error on page ${page}: ${error.message}`)
+      errorCount++
+
+      // 如果连续错误超过 10 次，可能是源站挂了，停止任务防止死循环
+      if (errorCount > 10) {
+        console.error("🔥 Too many errors, stopping sync task.")
+        break
+      }
+
+      // 遇到错误，等待 3 秒后重试下一页 (跳过当前页，或者你可以选择不 page++ 来重试当前页)
+      // 这里选择 page++ 跳过坏页，防止卡死
+      console.log("⏳ Waiting 3s before next page...")
+      await new Promise((r) => setTimeout(r, 3000))
+      page++
     }
-
-    page++
-
-    // 简单的限流，防止被封 IP
-    // await new Promise(r => setTimeout(r, 100));
   } while (page <= totalPage)
 
   console.log(`🎉 Sync Complete! Total processed: ${processedCount}`)
 }
 
-// 如果直接运行此文件 (node scripts/sync_maotai.js)
+// ... 底部启动代码保持不变 ...
 if (require.main === module) {
   const MONGO_URI = process.env.MONGO_URI
   if (!MONGO_URI) {
-    console.error("❌ MONGO_URI is missing in .env")
+    console.error("❌ MONGO_URI missing")
     process.exit(1)
   }
-
-  mongoose
-    .connect(MONGO_URI)
-    .then(async () => {
-      console.log("🔥 DB Connected")
-      // 首次建议跑全量: syncTask(99999)
-      // 日常跑增量: syncTask(24)
-      await syncTask(24)
-      process.exit(0)
-    })
-    .catch((err) => {
-      console.error("DB Error", err)
-      process.exit(1)
-    })
+  mongoose.connect(MONGO_URI).then(async () => {
+    await syncTask(24)
+    process.exit(0)
+  })
 }
 
 module.exports = { syncTask }

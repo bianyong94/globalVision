@@ -460,30 +460,63 @@ app.get("/api/v2/videos", async (req, res) => {
     const skip = (pg - 1) * limit
 
     const query = {}
-    if (cat) query.category = cat // movie, tv, anime...
 
-    // 标签筛选 (支持多个)
+    // 1. 基础筛选
+    if (cat && cat !== "all") query.category = cat
+    if (area) query.area = new RegExp(area)
+    if (year && year !== "全部") query.year = parseInt(year)
+
+    // 2. 标签逻辑处理 (核心修改)
     if (tag) {
-      // 如果传了 "悬疑", MongoDB 会自动在 tags 数组里找
       query.tags = tag
+
+      // 🔥 强制逻辑：如果是“高分”相关的标签
+      if (tag === "high_score" || tag === "douban_top") {
+        // 需求 A: 高分只包含电影，不要其他分类
+        query.category = "movie"
+
+        // 需求 B: 必须过滤掉 0 分的数据 (防止 0 分排在最后或最前)
+        query.rating = { $gt: 0 }
+      }
     }
 
-    if (area) query.area = new RegExp(area)
-    if (year) query.year = parseInt(year)
-
-    // 排序逻辑
+    // 3. 排序逻辑 (核心修改：解决分页乱序问题)
     let sortObj = { updatedAt: -1 } // 默认按更新时间
-    if (sort === "rating") sortObj = { rating: -1 }
-    if (sort === "year") sortObj = { year: -1 }
 
+    // 🔥 智能排序劫持：
+    // 即使前端传了 sort=time (默认值)，只要当前标签是 "high_score"，
+    // 我们强制在后端改为按 rating 排序。这样分页就是全局按分数的了。
+    if (sort === "rating" || tag === "high_score" || tag === "douban_top") {
+      sortObj = { rating: -1 }
+
+      // 双重保险：凡是按评分排，必须过滤掉 0 分
+      if (!query.rating) {
+        query.rating = { $gt: 0 }
+      }
+    } else if (sort === "year") {
+      sortObj = { year: -1 }
+    }
+
+    // 4. 执行查询
+    // MongoDB 的机制是：先 find(过滤) -> 再 sort(全局排序) -> 最后 skip/limit(分页)
+    // 所以这样写能保证第1页是9.9分，第2页是9.8分，绝对不会乱。
     const list = await Video.find(query)
       .sort(sortObj)
       .skip(skip)
       .limit(limit)
-      .select("title poster remarks rating year tags")
-
-    res.json({ code: 200, list })
+      .select("title poster remarks rating year tags uniq_id")
+    // ✅ 修正返回给前端的数据结构
+    const fixedList = list.map((item) => {
+      const doc = item._doc || item
+      return {
+        ...doc,
+        id: doc.uniq_id, // 映射
+      }
+    })
+    console.log(`[Filter] 筛选结果: ${fixedList.length} 条`)
+    res.json({ code: 200, fixedList })
   } catch (e) {
+    console.error("Filter Error:", e)
     res.status(500).json({ code: 500, msg: "Error" })
   }
 })
@@ -585,6 +618,16 @@ app.get("/api/home/trending", async (req, res) => {
 // v2. 首页“精装修”接口 (对应你截图的布局)
 app.get("/api/v2/home", async (req, res) => {
   try {
+    const fixId = (queryResult) =>
+      queryResult.map((item) => {
+        // item 可能是 mongoose document，需要转成普通对象
+        const doc = item._doc || item
+        return {
+          ...doc,
+          // ✅ 核心：把 uniq_id 赋值给 id
+          id: doc.uniq_id,
+        }
+      })
     // 并行查询，速度极快
     const [banners, netflix, shortDrama, highRateTv, newMovies] =
       await Promise.all([
@@ -700,12 +743,83 @@ app.get("/api/categories", async (req, res) => {
 })
 
 // [接口 4] 详情 (每次必回源 + 更新数据库)
+// app.get("/api/detail/:id", async (req, res) => {
+//   const { id } = req.params
+//   // 1️⃣ 先查缓存 (缓存 10 分钟)
+//   const cacheKey = `detail_${id}`
+//   const cachedData = await getCache(cacheKey)
+//   if (cachedData) return success(res, cachedData)
+//   const parseEpisodes = (urlStr, fromStr) => {
+//     if (!urlStr) return []
+//     const froms = (fromStr || "").split("$$$")
+//     const urls = urlStr.split("$$$")
+//     let idx = froms.findIndex((f) => f && f.toLowerCase().includes("m3u8"))
+//     if (idx === -1) idx = 0
+//     const targetUrl = urls[idx] || ""
+//     if (!targetUrl) return []
+//     return targetUrl.split("#").map((ep) => {
+//       const parts = ep.split("$")
+//       return {
+//         name: parts.length > 1 ? parts[0] : "正片",
+//         link: parts.length > 1 ? parts[1] : parts[0],
+//       }
+//     })
+//   }
+
+//   let sourceKey = PRIORITY_LIST[0]
+//   let vodId = id
+//   if (id.includes("$")) {
+//     const parts = id.split("$")
+//     sourceKey = parts[0]
+//     vodId = parts[1]
+//   }
+
+//   try {
+//     const result = await smartFetch(
+//       () => ({ ac: "detail", at: "json", ids: vodId }),
+//       sourceKey
+//     )
+
+//     if (
+//       !result ||
+//       !result.data ||
+//       !result.data.list ||
+//       result.data.list.length === 0
+//     ) {
+//       return fail(res, "资源不存在", 404)
+//     }
+
+//     const detail = result.data.list[0]
+//     const savedData = await saveToDB(detail, sourceKey)
+//     const responseData = {
+//       ...savedData,
+//       area: detail.vod_area,
+//       episodes: parseEpisodes(detail.vod_play_url, detail.vod_play_from),
+//       source: result.sourceName,
+//       latency: result.duration,
+//     }
+
+//     // 2️⃣ 写入缓存
+//     await setCache(cacheKey, responseData, 600)
+
+//     success(res, responseData)
+//   } catch (e) {
+//     console.error("Detail Error:", e.message)
+//     fail(res, "获取详情失败")
+//   }
+// })
+
+// 🔥🔥🔥 [核心修改] 详情页接口 (支持多源切换) 🔥🔥🔥
+// 🔥 修复 1：详情页接口 (入参映射 id -> uniq_id)
 app.get("/api/detail/:id", async (req, res) => {
-  const { id } = req.params
-  // 1️⃣ 先查缓存 (缓存 10 分钟)
-  const cacheKey = `detail_${id}`
+  const { id } = req.params // 前端传来的可能是 "maotai_12345"
+
+  // 缓存检查
+  const cacheKey = `detail_v3_${id}`
   const cachedData = await getCache(cacheKey)
   if (cachedData) return success(res, cachedData)
+
+  // 解析播放列表函数 (保持不变)
   const parseEpisodes = (urlStr, fromStr) => {
     if (!urlStr) return []
     const froms = (fromStr || "").split("$$$")
@@ -723,45 +837,89 @@ app.get("/api/detail/:id", async (req, res) => {
     })
   }
 
-  let sourceKey = PRIORITY_LIST[0]
-  let vodId = id
-  if (id.includes("$")) {
-    const parts = id.split("$")
-    sourceKey = parts[0]
-    vodId = parts[1]
-  }
-
   try {
-    const result = await smartFetch(
-      () => ({ ac: "detail", at: "json", ids: vodId }),
-      sourceKey
-    )
+    let videoDetail = null
+    let sourceKey = ""
 
-    if (
-      !result ||
-      !result.data ||
-      !result.data.list ||
-      result.data.list.length === 0
-    ) {
-      return fail(res, "资源不存在", 404)
+    // ✅ 核心修复：构建正确的数据库查询条件
+    // 数据库里只有 uniq_id (如 "maotai_12345") 和 vod_id (如 12345)
+    // 绝对不要查 { id: id }，因为 Schema 里没这个字段
+    let dbQuery = { uniq_id: id }
+
+    // 容错：如果传进来的是纯数字 (旧数据的 ID)，尝试查 vod_id
+    if (!id.includes("_") && !id.includes("$") && !isNaN(id)) {
+      dbQuery = { vod_id: parseInt(id) }
     }
 
-    const detail = result.data.list[0]
-    const savedData = await saveToDB(detail, sourceKey)
+    videoDetail = await Video.findOne(dbQuery)
+
+    // 3️⃣ 如果数据库没有，尝试回源 (Fallback)
+    if (!videoDetail) {
+      // 只有当 ID 符合 "source_id" 格式时才回源
+      if (id.includes("_") || id.includes("$")) {
+        const separator = id.includes("_") ? "_" : "$"
+        const parts = id.split(separator)
+        sourceKey = parts[0]
+        const vodId = parts[1]
+
+        console.log(
+          `[Detail] DB Miss, Fetching Remote: ${sourceKey} -> ${vodId}`
+        )
+        const result = await smartFetch(
+          () => ({ ac: "detail", at: "json", ids: vodId }),
+          sourceKey
+        )
+
+        if (result && result.data.list.length > 0) {
+          videoDetail = await saveToDB(result.data.list[0], sourceKey)
+        }
+      }
+    }
+
+    if (!videoDetail) return fail(res, "资源不存在", 404)
+
+    // 4️⃣ 查找同名资源
+    const siblings = await Video.find({
+      title: videoDetail.title,
+    }).select("uniq_id source remarks")
+
+    const availableSources = siblings.map((v) => ({
+      key: v.source,
+      name: sources[v.source] ? sources[v.source].name : v.source,
+      id: v.uniq_id, // ✅ 确保这里返回的是 uniq_id，前端作为 key
+      remarks: v.remarks,
+    }))
+
+    // 5️⃣ 组装返回数据
     const responseData = {
-      ...savedData,
-      area: detail.vod_area,
-      episodes: parseEpisodes(detail.vod_play_url, detail.vod_play_from),
-      source: result.sourceName,
-      latency: result.duration,
+      // ✅ 强制返回 id 字段给前端 (对应数据库的 uniq_id)
+      id: videoDetail.uniq_id,
+      uniq_id: videoDetail.uniq_id,
+
+      title: videoDetail.title,
+      pic: videoDetail.poster || videoDetail.pic,
+      year: videoDetail.year,
+      area: videoDetail.area,
+      content: videoDetail.overview || videoDetail.content,
+      actors: videoDetail.actors,
+      director: videoDetail.director,
+      category: videoDetail.category,
+      tags: videoDetail.tags,
+      episodes: parseEpisodes(
+        videoDetail.vod_play_url,
+        videoDetail.vod_play_from
+      ),
+      available_sources: availableSources,
+      current_source: {
+        key: videoDetail.source,
+        name: sources[videoDetail.source]?.name || videoDetail.source,
+      },
     }
 
-    // 2️⃣ 写入缓存
     await setCache(cacheKey, responseData, 600)
-
     success(res, responseData)
   } catch (e) {
-    console.error("Detail Error:", e.message)
+    console.error("Detail Error:", e)
     fail(res, "获取详情失败")
   }
 })
@@ -895,16 +1053,6 @@ app.delete("/api/user/history", async (req, res) => {
   }
 })
 
-// 启动采集任务
-// const runSyncTask = () => {
-//   console.log(`📅 [Sync] 触发全量采集...`)
-//   const syncProcess = exec("node scripts/sync.js")
-//   syncProcess.stdout.on("data", (d) => console.log(`[Sync] ${d.trim()}`))
-// }
-
-// if (process.env.NODE_ENV === "production") {
-//   setTimeout(runSyncTask, 5000)
-// }
 cron.schedule("0 */2 * * *", () => {
   syncTask(3) // 采集最近3小时的变动
 })
