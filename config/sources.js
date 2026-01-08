@@ -40,23 +40,24 @@ const CATEGORY_RELATIONS = {
 }
 
 module.exports = {
+  // 🔥 核心策略配置
+  MASTER_KEY: "maotai", // 只有这个源的数据是绝对权威，其他的只负责补缺
   CATEGORY_RELATIONS,
 
-  // 🚀 竞速优先级 (速度优先)
-  PRIORITY_LIST: [
-    // "feifan", // 🚀 非凡: 目前国内速度最快，资源更新最快
-    // "liangzi", // ⚛️ 量子: 速度与非凡并列，资源库巨大
-    // "baofeng", // 🌪️ 暴风: 老牌稳定，无广告或少广告，速度尚可
-    // "jinying", // 🦅 金鹰: 优质备用，画质通常不错
-    // "hongniu", // 🐂 红牛: 降级为兜底，因为国内访问慢
-    "maotai", // 🍶 茅台: 也不错，作为最后备选
-  ],
+  // 优先级列表 (搜索排序用)
+  PRIORITY_LIST: ["maotai", "feifan", "liangzi", "hongniu"],
 
   sources: {
     // ===========================
     // 1️⃣ 极速第一梯队 (国内优化)
     // ===========================
-
+    // 🍶 茅台资源
+    maotai: {
+      name: "茅台资源",
+      url: "https://caiji.maotaizy.cc/api.php/provide/vod/from/mtm3u8/",
+      id_map: MAP_STANDARD,
+      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
+    },
     // 🚀 非凡资源 (速度王)
     feifan: {
       name: "非凡资源",
@@ -73,50 +74,10 @@ module.exports = {
       id_map: MAP_STANDARD,
       home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
     },
-
-    // ===========================
-    // 2️⃣ 稳定第二梯队
-    // ===========================
-
-    // 🌪️ 暴风资源 (稳定)
-    baofeng: {
-      name: "暴风资源",
-      url: "https://ad.bfzyapi.com/api.php/provide/vod/from/bfm3u8/",
-      id_map: MAP_STANDARD,
-      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
-    },
-
-    // 🦅 金鹰资源 (画质好)
-    jinying: {
-      name: "金鹰资源",
-      url: "https://jyzyapi.com/api.php/provide/vod/from/jym3u8/",
-      id_map: MAP_STANDARD,
-      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
-    },
-
-    // ===========================
-    // 3️⃣ 兜底梯队 (库大但慢)
-    // ===========================
-
     // 🐂 红牛资源
     hongniu: {
       name: "红牛资源",
       url: "https://www.hongniuzy2.com/api.php/provide/vod/from/hnm3u8/",
-      id_map: MAP_STANDARD,
-      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
-    },
-
-    // 👁️ 快看资源 (备用)
-    kuaikan: {
-      name: "快看资源",
-      url: "https://kuaikanzy.net/api.php/provide/vod/from/kkm3u8/",
-      id_map: MAP_STANDARD,
-      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
-    },
-    // 🍶 茅台资源
-    maotai: {
-      name: "茅台资源",
-      url: "https://caiji.maotaizy.cc/api.php/provide/vod/from/mtm3u8/",
       id_map: MAP_STANDARD,
       home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
     },

@@ -340,203 +340,113 @@ const saveToDB = async (item, sourceKey) => {
   return videoData
 }
 
-// [接口 1] 列表与搜索：本地优先 + 自动互补 + 智能修正
-app.get("/api/videos", async (req, res) => {
-  const { t, pg = 1, wd, h, year } = req.query
-  const page = parseInt(pg)
-  const limit = 20
-  const skip = (page - 1) * limit
+// server.js 中的 /api/v2/videos 接口
 
-  try {
-    // 1. 构建本地查询条件
-    const query = {}
-    if (wd) {
-      const regex = new RegExp(wd, "i")
-      query.$or = [{ title: regex }, { actors: regex }, { director: regex }]
-    }
-
-    // 🔥 DB 映射：查父类时自动查库里的子类
-    if (t) {
-      const typeId = parseInt(t)
-      if (DB_QUERY_MAPPING[typeId]) {
-        query.type_id = { $in: DB_QUERY_MAPPING[typeId] }
-      } else {
-        query.type_id = typeId
-      }
-    }
-
-    if (year && year !== "全部") {
-      query.year = parseInt(year)
-    }
-
-    // 执行本地查询
-    const [localList, localTotal] = await Promise.all([
-      Video.find(query)
-        .select("id title poster type year rating remarks type_id")
-        .sort({ date: -1, year: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Video.countDocuments(query),
-    ])
-
-    // 2. 决策：是否回源
-    // 条件：搜索结果过少 OR 分类结果完全没有
-    const needRemote =
-      (wd && localList.length < 5) || (!wd && localList.length === 0)
-
-    if (page === 1 && needRemote) {
-      console.log(`[Hybrid] 本地不足 (t=${t}, wd=${wd}), 触发回源...`)
-
-      const paramsFn = (source) => {
-        const p = { ac: "detail", at: "json", pg: 1 }
-        if (wd) p.wd = wd
-
-        // 🔥 远程映射：查父类时自动转查热门子类 (解决 t=1 无数据)
-        if (t) {
-          let reqId = parseInt(t)
-          if (source.id_map && source.id_map[reqId])
-            reqId = source.id_map[reqId]
-
-          // 强制修正：父类 -> 热门子类
-          if (reqId === 1) reqId = 6 // 电影 -> 动作
-          if (reqId === 2) reqId = 13 // 剧集 -> 国产
-          p.t = reqId
-        }
-        if (year && year !== "全部") p.year = year
-        return p
-      }
-
-      try {
-        const remoteResult = await smartFetch(
-          paramsFn,
-          wd ? { scanAll: true } : null
-        )
-        const remoteList = remoteResult.data.list
-
-        // 远程数据入库并去重
-        const processedRemote = []
-        for (const item of remoteList) {
-          const savedItem = await saveToDB(item, remoteResult.sourceKey)
-          if (!localList.some((l) => l.title === savedItem.title)) {
-            processedRemote.push(savedItem)
-          }
-        }
-
-        const finalList = [...localList, ...processedRemote]
-        const finalTotal = localTotal + (remoteResult.data.total || 0)
-
-        return success(res, {
-          list: finalList,
-          total: finalTotal > 0 ? finalTotal : finalList.length,
-          page: page,
-          pagecount: Math.ceil(finalTotal / limit),
-          source: `Hybrid (Local + ${remoteResult.sourceName})`,
-        })
-      } catch (err) {
-        console.warn("[Hybrid] 远程回源失败:", err.message)
-      }
-    }
-
-    // 3. 返回结果
-    success(res, {
-      list: localList,
-      total: localTotal,
-      page: page,
-      pagecount: Math.ceil(localTotal / limit) || 1,
-      source: "Local Database",
-    })
-  } catch (e) {
-    console.error("API Videos Error:", e)
-    fail(res, "查询失败")
-  }
-})
-
-// ==========================================
-// 列表/搜索/筛选 统一接口
-// 前端调用: /api/v2/videos?wd=...&cat=...&tag=...&sort=...
-// ==========================================
 app.get("/api/v2/videos", async (req, res) => {
   try {
     const { cat, tag, area, year, sort, pg = 1, wd } = req.query
     const limit = 20
-    const skip = (pg - 1) * limit
+    const skip = (parseInt(pg) - 1) * limit
 
-    const query = {}
+    // ==========================================
+    // 1. 构建筛选条件 ($match)
+    // ==========================================
+    const matchStage = {}
 
-    // 1️⃣ 🔍 关键词搜索逻辑 (必须放在最前面)
+    // 🔍 关键词搜索
     if (wd) {
-      // 使用正则进行模糊匹配 (忽略大小写)
       const regex = new RegExp(wd, "i")
-      query.$or = [
-        { title: regex }, // 搜片名
-        { actors: regex }, // 搜演员
-        { director: regex }, // 搜导演
+      matchStage.$or = [
+        { title: regex },
+        { actors: regex },
+        { director: regex },
       ]
     }
 
-    // 2️⃣ 基础筛选 (分类/地区/年份)
+    // 📂 分类筛选
     if (cat && cat !== "all") {
-      query.category = cat
+      matchStage.category = cat
     }
 
+    // 🌍 地区筛选
     if (area) {
-      query.area = new RegExp(area)
+      matchStage.area = new RegExp(area)
     }
 
+    // 📅 年份筛选
     if (year && year !== "全部") {
-      query.year = parseInt(year)
+      matchStage.year = parseInt(year)
     }
 
-    // 3️⃣ 标签与高分逻辑
+    // 🏷️ 标签筛选
     if (tag) {
-      query.tags = tag
-
-      // 🔥 强制逻辑：如果是“高分”相关的标签
+      matchStage.tags = tag
+      // 如果是找“高分”或“豆瓣榜单”，必须过滤掉 0 分的垃圾数据
       if (tag === "high_score" || tag === "douban_top") {
-        // 需求 A: 高分只包含电影 (如果你希望剧集也有高分，可以去掉这就行)
-        query.category = "movie"
-
-        // 需求 B: 必须过滤掉 0 分的数据
-        query.rating = { $gt: 0 }
+        matchStage.rating = { $gt: 0 }
       }
     }
 
-    // 4️⃣ 排序逻辑
-    let sortObj = { year: -1 } // 默认按更新时间倒序
+    // ==========================================
+    // 2. 构建智能排序逻辑 ($sort) 🔥 核心修改
+    // ==========================================
+    let sortStage = {}
 
-    // 智能排序劫持
     if (sort === "rating" || tag === "high_score" || tag === "douban_top") {
-      sortObj = { rating: -1 }
-      // 再次确保按评分排时过滤掉 0 分
-      if (!query.rating) {
-        query.rating = { $gt: 0 }
+      // ✅ 场景 A: 用户想看【高分】
+      // 逻辑：先看分数 -> 分数一样看年份(越新越好) -> 年份一样看更新时间
+      sortStage = {
+        rating: -1, // 1. 评分优先 (10分 > 9分)
+        year: -1, // 2. 年份次之 (同9分，2025 > 1990)
+        updatedAt: -1, // 3. 更新时间兜底 (同分同年，刚更新的在前后)
       }
-    } else if (sort === "year") {
-      sortObj = { year: -1 }
-    } else if (sort === "time") {
-      // 显式传 time 时，也走这个逻辑
-      sortObj = { date: -1, year: -1 }
+
+      // 再次确保，按评分排时，如果没有筛选 rating>0，这里强制过滤 0 分
+      // 避免 0 分的数据因为 year 很大而混在中间（虽然 sort rating:-1 会把 0 放最后，但为了保险）
+      if (!matchStage.rating) {
+        matchStage.rating = { $gt: 0 }
+      }
+    } else {
+      // ✅ 场景 B: 用户想看【最新】(默认)
+      // 逻辑：先看年份 -> 年份一样看更新时间(集数更新) -> 都一样看评分(质量)
+      sortStage = {
+        year: -1, // 1. 绝对年份优先 (2026 > 2025)
+        updatedAt: -1, // 2. 也是2025，刚更新第16集的排在第10集前面
+        rating: -1, // 3. 都是2025且同时更新，9.0分的排在2.0分前面
+      }
     }
 
-    // 5️⃣ 执行查询
-    // 这里的 .select 必须包含 uniq_id，否则前端跳转会出错
-    const list = await Video.find(query)
-      .sort(sortObj)
-      .skip(skip)
-      .limit(limit)
-      .select("title poster remarks rating year tags uniq_id id")
+    // ==========================================
+    // 3. 执行聚合查询 (Aggregation)
+    // ==========================================
+    const pipeline = [
+      { $match: matchStage }, // 1. 筛选
+      { $sort: sortStage }, // 2. 排序
+      { $skip: skip }, // 3. 跳页
+      { $limit: limit }, // 4. 限制数量
+      {
+        $project: {
+          // 5. 输出字段 (精简数据量)
+          title: 1,
+          poster: 1,
+          rating: 1,
+          year: 1,
+          remarks: 1,
+          tags: 1,
+          uniq_id: 1,
+          category: 1,
+          updatedAt: 1, // 输出这个方便调试看排序是否生效
+          id: "$uniq_id", // 别名映射，前端展示需要 id
+        },
+      },
+    ]
 
-    // 6️⃣ 格式化返回 (映射 id)
-    const fixedList = list.map((item) => {
-      const doc = item._doc || item
-      return {
-        ...doc,
-        id: doc.uniq_id, // 确保前端能拿到 id
-      }
-    })
+    const list = await Video.aggregate(pipeline)
 
-    res.json({ code: 200, list: fixedList })
+    // ==========================================
+    // 4. 返回结果
+    // ==========================================
+    res.json({ code: 200, list: list })
   } catch (e) {
     console.error("Search API Error:", e)
     res.status(500).json({ code: 500, msg: "Error" })
@@ -1101,52 +1011,112 @@ app.post("/api/auth/login", async (req, res) => {
 })
 
 // 获取历史
+// [接口] 获取历史记录 (智能补全海报版)
 app.get("/api/user/history", async (req, res) => {
   const { username } = req.query
   if (!username) return success(res, [])
+
   try {
     const user = await User.findOne({ username })
-    if (!user) return success(res, [])
-    const validHistory = (user.history || []).filter(
-      (item) => item && item.id && item.title
-    )
+    if (!user || !user.history || user.history.length === 0) {
+      return success(res, [])
+    }
+
+    // 1. 提取所有历史记录的 ID
+    const historyIds = user.history.map((h) => h.id)
+
+    // 2. 批量去 Video 表查最新的海报、标题
+    // (只查需要的字段，速度极快)
+    const freshVideos = await Video.find({ uniq_id: { $in: historyIds } })
+      .select("uniq_id poster pic title")
+      .lean()
+
+    // 3. 转成 Map 方便快速匹配
+    const videoMap = {}
+    freshVideos.forEach((v) => {
+      videoMap[v.uniq_id] = v
+    })
+
+    // 4. 组装最终数据 (合并逻辑)
+    const enrichedHistory = user.history.map((historyItem) => {
+      // 尝试找到最新的视频信息
+      const freshInfo = videoMap[historyItem.id]
+
+      return {
+        ...historyItem, // 保留进度(progress)、观看时间(viewedAt)等
+
+        // 🔥 核心修复：优先用最新库里的海报，没有则用历史存的，还不行就给空
+        poster:
+          (freshInfo && (freshInfo.poster || freshInfo.pic)) ||
+          historyItem.poster ||
+          historyItem.pic ||
+          "",
+
+        // 顺便也更新一下标题，防止片名变更
+        title: freshInfo ? freshInfo.title : historyItem.title,
+      }
+    })
+
+    // 5. 过滤掉完全没数据且没标题的坏数据
+    const validHistory = enrichedHistory.filter((h) => h && h.title)
+
     success(res, validHistory)
   } catch (e) {
-    success(res, [])
+    console.error("Get History Error:", e)
+    success(res, []) // 失败降级返回空，防止前端报错
   }
 })
 
 // 添加历史
+// [接口] 添加历史记录 (加强版)
 app.post("/api/user/history", async (req, res) => {
   const { username, video, episodeIndex, progress } = req.body
-  if (!username || !video || !video.id) return fail(res, "参数错误", 400)
+
+  // 基础校验
+  if (!username || !video || !video.id) {
+    return fail(res, "参数错误: 缺少 username 或 video.id", 400)
+  }
+
   try {
     const user = await User.findOne({ username })
     if (!user) return fail(res, "用户不存在", 404)
 
     const targetId = String(video.id)
-    const rawId = targetId.includes("$") ? targetId.split("$")[1] : targetId
 
-    let newHistory = (user.history || []).filter((h) => {
-      const hId = String(h.id)
-      const hRawId = hId.includes("$") ? hId.split("$")[1] : hId
-      return hId !== targetId && hRawId !== rawId
-    })
+    // 1. 过滤掉已存在的同一部片子 (避免重复，把旧的删了加新的到最前面)
+    let newHistory = (user.history || []).filter(
+      (h) => String(h.id) !== targetId
+    )
+
+    // 2. 构造新的记录对象
+    // 🔥 关键点：确保 poster 字段有值
+    const posterUrl = video.poster || video.pic || ""
 
     const historyItem = {
-      ...video,
       id: targetId,
+      title: video.title || "未知片名",
+      poster: posterUrl, // 强制统一字段名为 poster
+      pic: posterUrl, // 兼容旧字段
       episodeIndex: parseInt(episodeIndex) || 0,
       progress: parseFloat(progress) || 0,
       viewedAt: new Date().toISOString(),
+      // 如果有其他字段想存（比如当前集数名），也可以解构进去
+      // ...video
     }
 
+    // 3. 插入到数组开头 (最近观看)
     newHistory.unshift(historyItem)
-    user.history = newHistory.slice(0, 50)
+
+    // 4. 限制长度 (只存最近 100 条)
+    user.history = newHistory.slice(0, 100)
+
+    // 告诉 Mongoose 数组有变化
     user.markModified("history")
     await user.save()
+
     success(res, user.history)
   } catch (e) {
+    console.error("Save History Error:", e)
     fail(res, "保存失败")
   }
 })

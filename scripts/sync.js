@@ -1,136 +1,238 @@
-// scripts/sync_maotai.js
+// scripts/sync.js
 require("dotenv").config()
 const mongoose = require("mongoose")
 const axios = require("axios")
 const Video = require("../models/Video")
+const { sources, MASTER_KEY } = require("../config/sources")
 const { classifyVideo } = require("../utils/classifier")
 
-const API_URL =
-  "https://caiji.maotaizy.cc/api.php/provide/vod/from/mtm3u8/at/json/"
-const SOURCE_KEY = "maotai"
+// 代理支持 (可选)
+const { HttpsProxyAgent } = require("https-proxy-agent")
+const agent = process.env.PROXY_URL
+  ? new HttpsProxyAgent(process.env.PROXY_URL)
+  : null
 
-const fetchPage = async (pg, hours) => {
-  // 设置更长的超时时间 15s
-  const res = await axios.get(API_URL, {
-    params: { ac: "detail", h: hours, pg: pg },
-    timeout: 15000,
-  })
-  return res.data
+/**
+ * 🛠️ 辅助：获取单页数据
+ */
+const fetchPage = async (sourceConfig, page, hours) => {
+  try {
+    const res = await axios.get(sourceConfig.url, {
+      params: {
+        ac: "detail",
+        at: "json",
+        pg: page,
+        h: hours, // 采集最近 N 小时
+      },
+      timeout: 15000, // 资源站慢，给15秒
+      httpAgent: agent,
+      httpsAgent: agent,
+    })
+    return res.data
+  } catch (error) {
+    console.error(
+      `❌ [Fetch Fail] ${sourceConfig.name} Page ${page}: ${error.message}`
+    )
+    return null
+  }
 }
 
-const transformData = (item) => {
+/**
+ * 🛠️ 辅助：数据清洗 (Raw -> DB Model)
+ */
+const transformData = (item, sourceKey) => {
+  // 1. 调用分类器
   const result = classifyVideo(item)
 
-  // 🛑 如果被黑名单拦截，返回 null
+  // 🛑 黑名单拦截 (短剧/伦理等)
   if (!result) return null
 
   const { category, tags } = result
 
   return {
-    uniq_id: `${SOURCE_KEY}_${item.vod_id}`,
+    // 唯一ID: 源_ID (确保同源唯一)
+    uniq_id: `${sourceKey}_${item.vod_id}`,
     vod_id: item.vod_id,
-    source: SOURCE_KEY,
-    title: item.vod_name,
-    director: item.vod_director,
-    actors: item.vod_actor,
+    source: sourceKey,
+
+    // 核心信息
+    title: item.vod_name.trim(),
     original_type: item.type_name,
     category: category,
     tags: tags,
+
+    // 详情
     poster: item.vod_pic,
+    director: (item.vod_director || "").substring(0, 255),
+    actors: (item.vod_actor || "").substring(0, 500),
     overview: (item.vod_content || "")
       .replace(/<[^>]+>/g, "")
       .substring(0, 500),
-    language: item.vod_lang, // 如果之前改了 Schema，这里要注意字段名
+    language: item.vod_lang,
     area: item.vod_area,
     year: parseInt(item.vod_year) || 0,
     date: item.vod_time,
     rating: parseFloat(item.vod_score) || 0,
     remarks: item.vod_remarks,
+
+    // 播放
     vod_play_from: item.vod_play_from,
     vod_play_url: item.vod_play_url,
+
     updatedAt: new Date(),
   }
 }
 
-const syncTask = async (hours = 24) => {
-  console.log(`🚀 [${new Date().toISOString()}] Start Syncing ${SOURCE_KEY}...`)
+/**
+ * 🔄 任务：同步单个源
+ */
+const syncSourceTask = async (key, hours) => {
+  const source = sources[key]
+  if (!source) return
 
-  let page = 3200
+  const isMaster = key === MASTER_KEY // 是否为核心源
+  console.log(
+    `\n🚀 [Start] ${source.name} [${
+      isMaster ? "👑 MASTER" : "🔍 FILLER"
+    }] (Last ${hours}h)...`
+  )
+
+  let page = 1
   let totalPage = 1
-  let processedCount = 0
-  let errorCount = 0 // 连续错误计数
+  let savedCount = 0
+  let skippedCount = 0
+  let errorStreak = 0
 
   do {
+    // 1. 拉取
+    const data = await fetchPage(source, page, hours)
+
+    // 2. 校验
+    if (!data || !data.list || data.list.length === 0) {
+      console.log(`🏁 ${source.name} ended at page ${page}.`)
+      break
+    }
+    totalPage = data.pagecount
+
+    // 3. 初步清洗
+    let cleanList = data.list
+      .map((item) => transformData(item, key))
+      .filter((item) => item !== null) // 过滤掉 null (短剧)
+
+    // 如果这一页全是短剧，直接下一页
+    if (cleanList.length === 0) {
+      page++
+      continue
+    }
+
+    // =========================================================
+    // 🔥 核心去重逻辑：如果不是 Master，检查库里有没有同名资源
+    // =========================================================
+    if (!isMaster) {
+      // 提取本页所有标题
+      const titles = cleanList.map((item) => item.title)
+
+      // 去数据库查：这些标题里，哪些已经存在了？(不分源，只要标题一样就算存在)
+      const existDocs = await Video.find({ title: { $in: titles } })
+        .select("title")
+        .lean()
+      const existSet = new Set(existDocs.map((d) => d.title))
+
+      // 只保留数据库里没有的 (Filling the gap)
+      const uniqueList = cleanList.filter((item) => !existSet.has(item.title))
+
+      skippedCount += cleanList.length - uniqueList.length
+      cleanList = uniqueList // 更新待插入列表
+    }
+
+    // 如果过滤完这一页没数据了，跳过写入
+    if (cleanList.length === 0) {
+      // console.log(`⏭️ Page ${page} all duplicates, skipping write.`); // 可选：减少日志噪音
+      page++
+      continue
+    }
+
+    // 4. 批量写入 (BulkWrite)
+    const operations = cleanList.map((doc) => ({
+      updateOne: {
+        filter: { uniq_id: doc.uniq_id },
+        update: { $set: doc, $setOnInsert: { createdAt: new Date() } },
+        upsert: true,
+      },
+    }))
+
     try {
-      // 1. 请求数据
-      const data = await fetchPage(page, hours)
-
-      // 2. 检查数据有效性
-      if (!data || !data.list || data.list.length === 0) {
-        console.log(`⚠️ Page ${page} is empty or end of list.`)
-        break
-      }
-
-      totalPage = data.pagecount
-
-      // 3. 数据清洗与转换
-      const operations = data.list
-        .map((item) => transformData(item)) // 清洗
-        .filter((item) => item !== null) // 过滤掉被屏蔽的 null
-        .map((doc) => ({
-          updateOne: {
-            filter: { uniq_id: doc.uniq_id },
-            update: { $set: doc },
-            upsert: true,
-          },
-        }))
-
-      // 4. 批量写入 (只有当有有效数据时才写入)
       if (operations.length > 0) {
-        await Video.bulkWrite(operations)
-        processedCount += operations.length
+        await Video.bulkWrite(operations, { ordered: false })
+        savedCount += operations.length
         console.log(
-          `✅ Page ${page}/${totalPage} saved (${operations.length} items).`
-        )
-      } else {
-        console.log(
-          `⚠️ Page ${page}/${totalPage} skipped (all items filtered).`
+          `📥 ${source.name} P${page}/${totalPage}: Saved ${operations.length} items.`
         )
       }
+      errorStreak = 0
+    } catch (e) {
+      console.error(`💥 Write Error: ${e.message}`)
+      errorStreak++
+    }
 
-      // 重置连续错误计数
-      errorCount = 0
-      page++
-    } catch (error) {
-      console.error(`❌ Error on page ${page}: ${error.message}`)
-      errorCount++
+    // 防封限速
+    await new Promise((r) => setTimeout(r, 500))
+    page++
 
-      // 如果连续错误超过 10 次，可能是源站挂了，停止任务防止死循环
-      if (errorCount > 10) {
-        console.error("🔥 Too many errors, stopping sync task.")
-        break
-      }
-
-      // 遇到错误，等待 3 秒后重试下一页 (跳过当前页，或者你可以选择不 page++ 来重试当前页)
-      // 这里选择 page++ 跳过坏页，防止卡死
-      console.log("⏳ Waiting 3s before next page...")
-      await new Promise((r) => setTimeout(r, 3000))
-      page++
+    // 连续错误保护
+    if (errorStreak > 10) {
+      console.error("🔥 Too many errors, aborting this source.")
+      break
     }
   } while (page <= totalPage)
 
-  console.log(`🎉 Sync Complete! Total processed: ${processedCount}`)
+  console.log(
+    `✅ ${source.name} Done. Saved: ${savedCount}, Skipped(Dup): ${skippedCount}`
+  )
 }
 
-// ... 底部启动代码保持不变 ...
+/**
+ * 🌍 主入口：只跑新源，不跑茅台
+ */
+const syncTask = async (hours = 24) => {
+  console.log("========================================")
+  console.log(`🔥 SYNC STARTED (Time: ${hours}h)`)
+  console.log(
+    `🛑 Ghost Master: ${MASTER_KEY} (Using DB data for deduplication)`
+  )
+  console.log("========================================")
+
+  // 📝 在这里指定你要跑的源 (排除了 maotai)
+  const targetSources = ["feifan", "liangzi", "hongniu"]
+
+  for (const key of targetSources) {
+    try {
+      if (sources[key]) {
+        await syncSourceTask(key, hours)
+      }
+    } catch (e) {
+      console.error(`❌ Source ${key} failed:`, e)
+    }
+  }
+
+  console.log("\n🎉 ALL TASKS COMPLETED!")
+}
+// =========================================================
+// 🚀 独立运行支持 (node scripts/sync.js 999)
+// =========================================================
 if (require.main === module) {
   const MONGO_URI = process.env.MONGO_URI
   if (!MONGO_URI) {
-    console.error("❌ MONGO_URI missing")
+    console.error("❌ MONGO_URI missing in .env")
     process.exit(1)
   }
+
+  // 获取命令行参数小时数，默认24
+  const args = process.argv.slice(2)
+  const h = args[0] ? parseInt(args[0]) : 24
+
   mongoose.connect(MONGO_URI).then(async () => {
-    await syncTask(24)
+    await syncTask(h)
     process.exit(0)
   })
 }
