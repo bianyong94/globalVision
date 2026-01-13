@@ -557,7 +557,7 @@ app.get("/api/v2/home", async (req, res) => {
         return {
           ...doc,
           // ✅ 核心：把 uniq_id 赋值给 id
-          id: doc.uniq_id,
+          id: doc.uniq_id || doc.id || doc._id,
         }
       })
     // 并行查询，速度极快
@@ -567,42 +567,42 @@ app.get("/api/v2/home", async (req, res) => {
         Video.find({ tags: { $in: ["netflix", "4k"] }, category: "movie" })
           .sort({ updatedAt: -1 })
           .limit(5)
-          .select("title poster tags remarks id"),
+          .select("title poster tags remarks uniq_id"),
 
         // Section 1: Netflix 独家 (剧集)
         Video.find({ tags: "netflix", category: "tv" })
           .sort({ updatedAt: -1 })
           .limit(10)
-          .select("title poster remarks"),
+          .select("title poster remarks uniq_id"),
 
         // Section 2: 热门短剧 (专门筛选 miniseries 标签)
         Video.find({ tags: "miniseries" })
           .sort({ updatedAt: -1 })
           .limit(10)
-          .select("title poster remarks"),
+          .select("title poster remarks uniq_id"),
 
         // Section 3: 高分美剧 (分类+标签+评分排序)
         Video.find({ tags: "欧美", category: "tv", rating: { $gt: 0 } })
           .sort({ rating: -1 })
           .limit(10)
-          .select("title poster rating"),
+          .select("title poster rating uniq_id"),
 
         // Section 4: 院线新片
         Video.find({ category: "movie", tags: "new_arrival" })
           .sort({ updatedAt: -1 })
           .limit(12)
-          .select("title poster remarks"),
+          .select("title poster remarks uniq_id"),
       ])
 
     res.json({
       code: 200,
       data: {
-        banners,
+        banners: fixId(banners),
         sections: [
-          { title: "Netflix 精选", type: "scroll", data: netflix },
-          { title: "爆火短剧", type: "grid", data: shortDrama },
-          { title: "口碑美剧", type: "grid", data: highRateTv },
-          { title: "院线新片", type: "grid", data: newMovies },
+          { title: "Netflix 精选", type: "scroll", data: fixId(netflix) },
+          { title: "爆火短剧", type: "grid", data: fixId(shortDrama) },
+          { title: "口碑美剧", type: "grid", data: fixId(highRateTv) },
+          { title: "院线新片", type: "grid", data: fixId(newMovies) },
         ],
       },
     })
