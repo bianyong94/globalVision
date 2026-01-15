@@ -17,6 +17,7 @@ const Video = require("./models/Video") // 确保 ./models/Video.js 存在
 const { exec } = require("child_process")
 const { syncTask } = require("./scripts/sync")
 const cron = require("node-cron")
+const { runEnrichTask } = require("./scripts/enrich")
 
 // 引入源配置
 const { sources, PRIORITY_LIST } = require("./config/sources")
@@ -167,10 +168,21 @@ if (MONGO_URI) {
 
       // 2. 部署后自动触发采集 (后台运行)
       // ✅ 修改后的写法：延迟 10 秒执行，优先保证 Web 服务存活
+      // setTimeout(() => {
+      //   console.log("⏰ 延迟启动采集任务，防止阻塞启动...")
+      //   runStartupTask()
+      // }, 10000)
       setTimeout(() => {
-        console.log("⏰ 延迟启动采集任务，防止阻塞启动...")
-        runStartupTask()
-      }, 10000)
+        console.log("⏰ 触发启动后自动清洗...")
+        runEnrichTask(true).catch((e) => console.error("清洗任务出错:", e))
+      }, 10000) // 10秒后开始，不影响启动速度
+
+      // 策略 B: 每隔 4 小时检查一次有没有漏网之鱼 (增量清洗)
+      // 如果你有 node-cron，可以用 cron；如果没有，setInterval 也可以
+      setInterval(() => {
+        console.log("⏰ 触发定时增量清洗...")
+        runEnrichTask(true).catch((e) => console.error("定时清洗出错:", e))
+      }, 4 * 60 * 60 * 1000) // 4小时一次
     })
     .catch((err) => console.error("❌ MongoDB Connection Error:", err))
 }
@@ -309,35 +321,116 @@ const success = (res, data) => res.json({ code: 200, message: "success", data })
 const fail = (res, msg = "Error", code = 500) =>
   res.json({ code, message: msg })
 
-// 辅助：数据清洗入库
-const saveToDB = async (item, sourceKey) => {
-  const videoData = {
-    id: `${sourceKey}$${item.vod_id}`,
-    title: item.vod_name,
-    type_id: parseInt(item.type_id) || 0,
-    type: item.type_name,
-    poster: item.vod_pic,
-    remarks: item.vod_remarks,
-    year: parseInt(item.vod_year) || 0,
-    rating: parseFloat(item.vod_score) || 0,
-    date: item.vod_time,
-    actors: item.vod_actor || "",
-    director: item.vod_director || "",
-    overview: (item.vod_content || "")
-      .replace(/<[^>]+>/g, "")
-      .trim()
-      .substring(0, 200),
-    vod_play_from: item.vod_play_from,
-    vod_play_url: item.vod_play_url,
-    updatedAt: new Date(),
+// ==========================================
+// 🛠️ 辅助工具：ID转大类 (解决分类数据少的问题)
+// ==========================================
+const getCategoryByTypeId = (id) => {
+  id = parseInt(id)
+  // 电影: 1, 6-12 (动作,喜剧等)
+  if (id === 1 || (id >= 6 && id <= 12)) return "movie"
+  // 剧集: 2, 13-16 (国产,港台,欧美,日韩), 20-24 (海外等)
+  if (id === 2 || (id >= 13 && id <= 24)) return "tv"
+  // 综艺: 3, 25-28
+  if (id === 3 || (id >= 25 && id <= 29)) return "variety"
+  // 动漫: 4, 30-34
+  if (id === 4 || (id >= 30 && id <= 39)) return "anime"
+  // 体育: 5
+  if (id === 5 || (id >= 40 && id <= 45)) return "sports"
+  return "other"
+}
+
+// 🛠️ 辅助工具：年份清洗 (解决 20215 问题)
+const cleanYear = (rawYear) => {
+  let y = parseInt(rawYear)
+  // 1. 如果年份是 202411 这种格式，尝试截取前四位
+  if (y > 3000) {
+    y = parseInt(String(y).substring(0, 4))
   }
-  // 异步更新，不阻塞
-  Video.updateOne(
-    { id: videoData.id },
-    { $set: videoData },
-    { upsert: true }
-  ).catch((e) => {})
-  return videoData
+  // 2. 范围校验：必须在 1900 - 2030 之间，否则归为 0 (未知)
+  if (isNaN(y) || y < 1900 || y > 2030) return 0
+  return y
+}
+// ==========================================
+// 🛠️ 辅助函数：saveToDB (入库标准化)
+// ==========================================
+const saveToDB = async (item, sourceKey) => {
+  try {
+    // 1. 基础年份清洗 (即使 TMDB 挂了，这里也能保证年份不乱码)
+    let safeYear = parseInt(item.vod_year)
+    if (isNaN(safeYear) || safeYear < 1900 || safeYear > 2030) {
+      // 尝试从 update time 提取年份
+      safeYear = item.vod_time ? parseInt(item.vod_time.substring(0, 4)) : 0
+    }
+
+    // 2. 基础分类映射 (即使 TMDB 挂了，分类也不会空)
+    const typeId = parseInt(item.type_id) || 0
+    let category = "other"
+    if (typeId === 1 || (typeId >= 6 && typeId <= 12)) category = "movie"
+    else if (typeId === 2 || (typeId >= 13 && typeId <= 24)) category = "tv"
+    else if (typeId === 3 || (typeId >= 25 && typeId <= 29))
+      category = "variety"
+    else if (typeId === 4 || (typeId >= 30 && typeId <= 39)) category = "anime"
+
+    // 3. 基础标签推断 (不需要请求 API 就能做的事)
+    let tags = []
+    const title = item.vod_name || ""
+    const typeName = item.type_name || ""
+
+    // 简单关键词打标
+    if (title.includes("4K") || title.includes("2160P")) tags.push("4K")
+    if (typeName.includes("短剧") || title.includes("短剧"))
+      tags.push("miniseries")
+
+    // 4. 构建数据对象
+    const videoData = {
+      id: `${sourceKey}$${item.vod_id}`,
+      uniq_id: `${sourceKey}_${item.vod_id}`,
+      source: sourceKey,
+      vod_id: item.vod_id,
+
+      title: title.trim(),
+      type_id: typeId,
+      type: typeName,
+      category: category,
+      tags: tags, // 基础标签
+
+      poster: item.vod_pic,
+      remarks: item.vod_remarks,
+      year: safeYear,
+      date: item.vod_time,
+
+      rating: parseFloat(item.vod_score) || 0, // 暂时用采集站的假评分
+
+      actors: item.vod_actor || "",
+      director: item.vod_director || "",
+      overview: (item.vod_content || "")
+        .replace(/<[^>]+>/g, "")
+        .substring(0, 200),
+
+      vod_play_from: item.vod_play_from,
+      vod_play_url: item.vod_play_url,
+      updatedAt: new Date(),
+    }
+
+    // 🔥 重点：我们不写入 tmdb_id 字段
+    // 这样后台的 enrich-all.js 脚本就会自动识别出这是一条“未精修”的数据，
+    // 并在下一次运行时自动把它变成“精装修”数据。
+
+    await Video.updateOne(
+      { uniq_id: videoData.uniq_id },
+      {
+        $set: videoData,
+        // 仅当是新插入的数据时，确保 tmdb_id 不存在（虽然默认就不存在，但为了保险）
+        $unset: { tmdb_id: "" },
+      },
+      { upsert: true }
+    )
+
+    return videoData
+  } catch (e) {
+    console.error("SaveToDB Error:", e.message)
+    return null
+  }
 }
 
 // server.js 中的 /api/v2/videos 接口
@@ -564,16 +657,19 @@ app.get("/api/v2/home", async (req, res) => {
     const [banners, netflix, shortDrama, highRateTv, newMovies] =
       await Promise.all([
         // 轮播图：取最近更新的 4K 电影或 Netflix 剧集
-        Video.find({ tags: { $in: ["netflix", "4k"] }, category: "movie" })
-          .sort({ updatedAt: -1 })
+        Video.find({
+          category: "movie",
+          $or: [{ tags: "4k" }, { year: new Date().getFullYear() }],
+        })
+          .sort({ updatedAt: -1 }) // 按更新时间排
           .limit(5)
-          .select("title poster tags remarks uniq_id"),
+          .select("title poster tags remarks uniq_id id"),
 
-        // Section 1: Netflix 独家 (剧集)
-        Video.find({ tags: "netflix", category: "tv" })
-          .sort({ updatedAt: -1 })
+        // 2. Netflix 栏目 -> 改为 "精选欧美剧" (如果没有 netflix 标签，就查欧美分类)
+        Video.find({ tags: "netflix" })
+          .sort({ rating: -1, updatedAt: -1 })
           .limit(10)
-          .select("title poster remarks uniq_id"),
+          .select("title poster remarks uniq_id id"),
 
         // Section 2: 热门短剧 (专门筛选 miniseries 标签)
         Video.find({ tags: "miniseries" })
@@ -588,10 +684,14 @@ app.get("/api/v2/home", async (req, res) => {
           .select("title poster rating uniq_id"),
 
         // Section 4: 院线新片
-        Video.find({ category: "movie", tags: "new_arrival" })
+        // 5. 院线新片 -> 只要是电影且年份是今年或去年
+        Video.find({
+          category: "movie",
+          year: { $gte: new Date().getFullYear() - 1 },
+        })
           .sort({ updatedAt: -1 })
           .limit(12)
-          .select("title poster remarks uniq_id"),
+          .select("title poster remarks uniq_id id"),
       ])
 
     res.json({
@@ -1140,6 +1240,141 @@ app.delete("/api/user/history", async (req, res) => {
 cron.schedule("0 */2 * * *", () => {
   syncTask(3) // 采集最近3小时的变动
 })
+
+// ==========================================
+// 🛠️ 运维专用：清洗脏数据 (不删除，只修正)
+// 调用方法：浏览器访问 /api/maintenance/fix
+// ==========================================
+app.get("/api/maintenance/fix", async (req, res) => {
+  try {
+    console.log("🧹 开始执行数据清洗任务...")
+    let log = []
+
+    // -------------------------------------------------
+    // 1. 修复年份异常 (如 20215 -> 2021)
+    // -------------------------------------------------
+    // 逻辑：查找所有年份大于 2026 或 小于 1900 的数据
+    const badYearVideos = await Video.find({
+      $or: [{ year: { $gt: 2026 } }, { year: { $lt: 1900 } }],
+    }).select("_id year date")
+
+    let yearFixCount = 0
+    for (const v of badYearVideos) {
+      // 尝试从 year 字段修复 (例如 "202504" -> 2025)
+      let newYear = parseInt(String(v.year).substring(0, 4))
+
+      // 如果修复失败，尝试从 date 字段提取 (例如 "2023-12-05" -> 2023)
+      if (isNaN(newYear) || newYear > 2026) {
+        if (v.date) {
+          newYear = parseInt(v.date.substring(0, 4))
+        }
+      }
+
+      // 如果还是无效，设为 0
+      if (isNaN(newYear) || newYear < 1900 || newYear > 2026) {
+        newYear = 0
+      }
+
+      await Video.updateOne({ _id: v._id }, { $set: { year: newYear } })
+      yearFixCount++
+    }
+    log.push(`✅ 修复异常年份数据: ${yearFixCount} 条`)
+
+    // -------------------------------------------------
+    // 2. 批量补全 tags (解决首页"短剧"、"4K"不显示的问题)
+    // -------------------------------------------------
+
+    // A. 补全【短剧】标签
+    // 条件：标题或类型包含"短剧"，且 tags 里还没有 "miniseries"
+    const fixShort = await Video.updateMany(
+      {
+        $or: [{ title: /短剧/ }, { type: /短剧/ }],
+        tags: { $ne: "miniseries" }, // 只有当 tags 不包含 miniseries 时才更新
+      },
+      { $addToSet: { tags: "miniseries" } } // $addToSet 确保不重复添加
+    )
+    log.push(`🏷️ 补全 [短剧] 标签: ${fixShort.modifiedCount} 条`)
+
+    // B. 补全【4K】标签
+    const fix4k = await Video.updateMany(
+      {
+        title: /4K|2160P/i,
+        tags: { $ne: "4k" },
+      },
+      { $addToSet: { tags: "4k" } }
+    )
+    log.push(`🏷️ 补全 [4K] 标签: ${fix4k.modifiedCount} 条`)
+
+    // C. 补全【Netflix】标签 (根据分类和关键字)
+    const fixNetflix = await Video.updateMany(
+      {
+        category: "tv",
+        type: /欧美|美剧/,
+        tags: { $ne: "netflix" },
+      },
+      { $addToSet: { tags: "netflix" } }
+    )
+    log.push(`🏷️ 补全 [Netflix/欧美剧] 标签: ${fixNetflix.modifiedCount} 条`)
+
+    // -------------------------------------------------
+    // 3. 修复错误的 Category (防止分类为空)
+    // -------------------------------------------------
+    // 比如：有些 type_id 是 13 (国产剧)，但 category 却是 "other" 或空的
+
+    // 修复电影 (ID: 1, 6-12)
+    const fixMovies = await Video.updateMany(
+      {
+        type_id: { $in: [1, 6, 7, 8, 9, 10, 11, 12] },
+        category: { $ne: "movie" },
+      },
+      { $set: { category: "movie" } }
+    )
+
+    // 修复剧集 (ID: 2, 13-16, 20-24)
+    const fixTv = await Video.updateMany(
+      {
+        type_id: { $in: [2, 13, 14, 15, 16, 20, 21, 22, 23, 24] },
+        category: { $ne: "tv" },
+      },
+      { $set: { category: "tv" } }
+    )
+
+    // 修复动漫 (ID: 4, 30-34)
+    const fixAnime = await Video.updateMany(
+      {
+        type_id: { $in: [4, 29, 30, 31, 32, 33, 34] },
+        category: { $ne: "anime" },
+      },
+      { $set: { category: "anime" } }
+    )
+
+    // 修复综艺 (ID: 3, 25-29)
+    const fixVariety = await Video.updateMany(
+      { type_id: { $in: [3, 25, 26, 27, 28] }, category: { $ne: "variety" } },
+      { $set: { category: "variety" } }
+    )
+
+    log.push(
+      `📂 修正分类归属: 电影${fixMovies.modifiedCount}, 剧集${fixTv.modifiedCount}, 动漫${fixAnime.modifiedCount}, 综艺${fixVariety.modifiedCount}`
+    )
+
+    // -------------------------------------------------
+    // 4. 清理无效数据 (可选)
+    // -------------------------------------------------
+    // 删除没有播放地址 且 没有图片 的垃圾数据
+    const delResult = await Video.deleteMany({
+      vod_play_url: { $exists: false },
+      poster: { $exists: false },
+    })
+    log.push(`🗑️ 清理完全无效数据: ${delResult.deletedCount} 条`)
+
+    res.json({ code: 200, message: "数据维护完成", logs: log })
+  } catch (e) {
+    console.error(e)
+    res.status(500).json({ code: 500, msg: e.message })
+  }
+})
+
 // 错误处理
 app.use((err, req, res, next) => {
   console.error("Global Error:", err)

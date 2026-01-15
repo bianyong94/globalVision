@@ -42,6 +42,7 @@ const VideoSchema = new mongoose.Schema(
     // 播放地址
     vod_play_from: String,
     vod_play_url: String,
+    tmdb_id: { type: Number, index: true },
 
     // 系统更新时间
     updatedAt: { type: Date, default: Date.now },
@@ -62,5 +63,5 @@ VideoSchema.index(
 )
 // 复合查询索引 (用于类似 "找美剧+悬疑+按时间排序" 的查询)
 VideoSchema.index({ category: 1, tags: 1, updatedAt: -1 })
-
+VideoSchema.index({ tmdb_id: 1 })
 module.exports = mongoose.model("Video", VideoSchema)
