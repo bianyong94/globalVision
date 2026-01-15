@@ -175,7 +175,7 @@ if (MONGO_URI) {
         // 先采集最近 6小时的数据
         syncTask(6).then(() => {
           // 采集完了，紧接着触发清洗
-          runEnrichTask(false)
+          runEnrichTask(true)
         })
       }, 5000)
       // 任务 B: 定时采集 (每 2 小时)
