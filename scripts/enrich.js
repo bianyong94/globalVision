@@ -34,6 +34,23 @@ async function processBatch(videos) {
   const tasks = videos.map((video) => {
     return limit(async () => {
       try {
+        // 🔥🔥🔥 新增：垃圾数据熔断机制 🔥🔥🔥
+        const rawType = video.original_type || video.type || ""
+        const rawTitle = video.title || ""
+
+        // 如果原始分类或标题包含垃圾词，直接标记为 -1 (不匹配)，并退出
+        if (
+          /短剧|爽文|爽剧|反转|赘婿|战神|逆袭|重生|现代都市/.test(rawType) ||
+          /短剧|爽文/.test(rawTitle)
+        ) {
+          // console.log(`跳过垃圾数据: ${rawTitle} (${rawType})`);
+          return {
+            updateOne: {
+              filter: { _id: video._id },
+              update: { $set: { tmdb_id: -1 } }, // 标记为垃圾，以后不再洗
+            },
+          }
+        }
         // 1. 标题清洗 (保持不变)
         const cleanTitle = (video.title || "")
           .replace(/第[0-9一二三四五六七八九十]+[季部]/g, "")

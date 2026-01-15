@@ -167,31 +167,42 @@ if (MONGO_URI) {
     .connect(MONGO_URI)
     .then(() => {
       // 1. 先启动 HTTP 服务，确保网站立刻能访问
+      const isDev = process.env.NODE_ENV === "development"
+      const forceRun = process.env.FORCE_RUN === "true"
+      if (isDev && !forceRun) {
+        console.log(
+          "🚧 [开发环境] 自动跳过后台清洗/采集任务 (防止占用本地资源)"
+        )
+        console.log(
+          "💡 提示: 如需在本地测试任务，请在 .env 添加 FORCE_RUN=true"
+        )
+      } else {
+        setTimeout(() => {
+          console.log("⏰ 启动触发：开始增量采集 + 清洗...")
+          // 先采集最近 6小时的数据
+          syncTask(6).then(() => {
+            // 采集完了，紧接着触发清洗
+            runEnrichTask(true)
+          })
+        }, 5000)
+        // 任务 B: 定时采集 (每 2 小时)
+        // 采集最近 4 小时的数据 (重叠一点时间防止漏抓)
+        setInterval(() => {
+          console.log("⏰ 定时触发：开始增量采集...")
+          syncTask(4).catch((e) => console.error(e))
+        }, 2 * 60 * 60 * 1000)
 
+        // 任务 C: 定时清洗 (每 1 小时)
+        // 负责把刚刚采集进来的"脏数据"洗干净
+        setInterval(() => {
+          console.log("⏰ 定时触发：开始数据清洗...")
+          runEnrichTask(false).catch((e) => console.error(e))
+        }, 1 * 60 * 60 * 1000)
+      }
       // 2. 部署后自动触发采集 (后台运行)
       // ✅ 修改后的写法：延迟 10 秒执行，优先保证 Web 服务存活
-      setTimeout(() => {
-        console.log("⏰ 启动触发：开始增量采集 + 清洗...")
-        // 先采集最近 6小时的数据
-        syncTask(6).then(() => {
-          // 采集完了，紧接着触发清洗
-          runEnrichTask(true)
-        })
-      }, 5000)
-      // 任务 B: 定时采集 (每 2 小时)
-      // 采集最近 4 小时的数据 (重叠一点时间防止漏抓)
-      setInterval(() => {
-        console.log("⏰ 定时触发：开始增量采集...")
-        syncTask(4).catch((e) => console.error(e))
-      }, 2 * 60 * 60 * 1000)
-
-      // 任务 C: 定时清洗 (每 1 小时)
-      // 负责把刚刚采集进来的"脏数据"洗干净
-      setInterval(() => {
-        console.log("⏰ 定时触发：开始数据清洗...")
-        runEnrichTask(false).catch((e) => console.error(e))
-      }, 1 * 60 * 60 * 1000)
     })
+
     .catch((err) => console.error("❌ MongoDB Connection Error:", err))
 }
 // ==========================================
@@ -458,7 +469,7 @@ app.get("/api/v2/videos", async (req, res) => {
     // 1. 构建筛选条件 ($match)
     // ==========================================
     const matchStage = {}
-
+    let sortStage = { updatedAt: -1 }
     // 🔍 关键词搜索
     if (wd) {
       const regex = new RegExp(wd, "i")
@@ -496,9 +507,17 @@ app.get("/api/v2/videos", async (req, res) => {
     // ==========================================
     // 2. 构建智能排序逻辑 ($sort) 🔥 核心修改
     // ==========================================
-    let sortStage = {}
 
-    if (sort === "rating" || tag === "high_score" || tag === "douban_top") {
+    if (sort === "rating" || tag === "high_score" || tag === "高分电影") {
+      // 1. 强制只看 TMDB 清洗过的数据 (关键！排除采集站的假 10 分)
+      matchStage.tmdb_id = { $exists: true }
+
+      // 2. 强制评分门槛 (例如大于 7.0 分)
+      matchStage.rating = { $gt: 6.5 }
+      if (!cat || cat === "all") {
+        matchStage.category = "movie"
+      }
+
       // ✅ 场景 A: 用户想看【高分】
       // 逻辑：先看分数 -> 分数一样看年份(越新越好) -> 年份一样看更新时间
       sortStage = {
@@ -512,6 +531,12 @@ app.get("/api/v2/videos", async (req, res) => {
       if (!matchStage.rating) {
         matchStage.rating = { $gt: 0 }
       }
+    } else if (tag === "netflix") {
+      matchStage.tags = "netflix"
+      // Netflix 专区也建议优先展示清洗过的数据
+      // matchStage.tmdb_id = { $exists: true };
+    } else if (tag === "4k") {
+      matchStage.tags = { $in: ["4K", "4k"] }
     } else {
       // ✅ 场景 B: 用户想看【最新】(默认)
       // 逻辑：先看年份 -> 年份一样看更新时间(集数更新) -> 都一样看评分(质量)
@@ -520,6 +545,16 @@ app.get("/api/v2/videos", async (req, res) => {
         updatedAt: -1, // 2. 也是2025，刚更新第16集的排在第10集前面
         rating: -1, // 3. 都是2025且同时更新，9.0分的排在2.0分前面
       }
+    }
+
+    // 📶 排序参数处理 (sort 参数)
+    if (sort === "rating") {
+      // 🔥 如果用户手动点击了 "按评分"，也必须过滤垃圾数据
+      matchStage.tmdb_id = { $exists: true } // 必须有 TMDB ID
+      matchStage.rating = { $gt: 0 } // 分数必须大于 0
+      sortStage = { rating: -1, year: -1 }
+    } else if (sort === "year") {
+      sortStage = { year: -1, updatedAt: -1 }
     }
 
     // ==========================================
@@ -691,7 +726,14 @@ app.get("/api/v2/home", async (req, res) => {
           .select("title poster remarks uniq_id"),
 
         // Section 3: 高分美剧 (分类+标签+评分排序)
-        Video.find({ tags: "欧美", category: "tv", rating: { $gt: 0 } })
+        Video.find({
+          category: "tv",
+          // 只要标签里沾边的都算，增加命中率
+          tags: {
+            $in: ["欧美", "美剧", "netflix", "hbo", "apple_tv", "disney"],
+          },
+          // rating: { $gt: 0 } // 暂时只要求有分就行，先别要求太高，看有没有数据
+        })
           .sort({ rating: -1 })
           .limit(10)
           .select("title poster rating uniq_id"),
@@ -1388,6 +1430,185 @@ app.get("/api/maintenance/fix", async (req, res) => {
   }
 })
 
+// tmdb相关接口
+const proxyUrl = process.env.PROXY_URL
+const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : null
+
+if (proxyUrl) {
+  console.log(
+    `🔌 [本地模式] 已检测到代理配置，TMDB 将通过代理访问: ${proxyUrl}`
+  )
+}
+// 1. 初始化 TMDB Axios 实例 (复用之前的配置)
+const tmdbApi = axios.create({
+  baseURL: "https://api.themoviedb.org/3",
+  headers: { Authorization: `Bearer ${process.env.TMDB_TOKEN}` },
+  params: { language: "zh-CN" },
+  httpsAgent: agent,
+  proxy: false,
+})
+
+// ==========================================
+// 🎞️ 接口 A: 获取 Netflix 热门剧集 (从 TMDB 实时拉取)
+// ==========================================
+app.get("/api/v2/tmdb/netflix", async (req, res) => {
+  try {
+    const response = await tmdbApi.get("/discover/tv", {
+      params: {
+        with_watch_providers: 8, // Netflix ID
+        watch_region: "US", // 或者 TW
+        sort_by: "popularity.desc",
+        "vote_count.gte": 100, // 过滤太冷门的
+      },
+    })
+
+    // 格式化一下返回给前端
+    const list = response.data.results.map((item) => ({
+      tmdb_id: item.id,
+      title: item.name, // 剧集叫 name
+      poster: `https://image.tmdb.org/t/p/w500${item.poster_path}`,
+      backdrop: `https://image.tmdb.org/t/p/w780${item.backdrop_path}`,
+      rating: item.vote_average,
+      year: parseInt((item.first_air_date || "").substring(0, 4)),
+      overview: item.overview,
+      category: "tv", // 明确这是剧集
+    }))
+
+    success(res, list)
+  } catch (e) {
+    console.error("Netflix API Error:", e.message)
+    fail(res, "无法获取 Netflix 榜单")
+  }
+})
+
+// ==========================================
+// 🏆 接口 B: 获取高分电影榜单 (从 TMDB 实时拉取)
+// ==========================================
+app.get("/api/v2/tmdb/top_rated", async (req, res) => {
+  try {
+    const response = await tmdbApi.get("/discover/movie", {
+      params: {
+        sort_by: "vote_average.desc",
+        "vote_count.gte": 1000, // 必须超过1000人评分，防止小众刷分
+        "vote_average.gte": 8.0, // 8分以上
+      },
+    })
+
+    const list = response.data.results.map((item) => ({
+      tmdb_id: item.id,
+      title: item.title, // 电影叫 title
+      poster: `https://image.tmdb.org/t/p/w500${item.poster_path}`,
+      backdrop: `https://image.tmdb.org/t/p/w780${item.backdrop_path}`,
+      rating: item.vote_average,
+      year: parseInt((item.release_date || "").substring(0, 4)),
+      overview: item.overview,
+      category: "movie",
+    }))
+
+    success(res, list)
+  } catch (e) {
+    fail(res, "无法获取高分榜单")
+  }
+})
+
+// ==========================================
+// 🔗 接口 C: 资源匹配 (支持 ID 匹配或 标题匹配)
+// ==========================================
+// server.js -> /api/v2/resource/match 接口
+
+app.get("/api/v2/resource/match", async (req, res) => {
+  // 1. 接收参数增加 year (年份)
+  const { tmdb_id, category, title, year } = req.query
+
+  if (!tmdb_id && !title) {
+    return fail(res, "缺少匹配参数", 400)
+  }
+
+  try {
+    let video = null
+
+    // 🎯 策略 A: TMDB ID 精准匹配 (最稳)
+    if (tmdb_id) {
+      const tmdbIdNum = parseInt(tmdb_id)
+      if (!isNaN(tmdbIdNum)) {
+        video = await Video.findOne({ tmdb_id: tmdbIdNum })
+      }
+      if (!video) {
+        video = await Video.findOne({ tmdb_id: tmdb_id })
+      }
+    }
+
+    // 🔎 策略 B: 标题兜底匹配 (必须加入年份校验！)
+    if (!video && title) {
+      console.log(`[Match] 尝试标题匹配: ${title} (${year || "无年份"})`)
+
+      const query = { title: title }
+
+      // 🔒 1. 强分类校验
+      if (category && category !== "all") {
+        query.category = category
+      }
+
+      // 🔒 2. 年份模糊校验 (关键修复！)
+      // 如果前端传了年份 (比如 1972)，我们只匹配 1971-1973 之间的数据
+      // 防止匹配到 2024 年的同名短剧
+      if (year) {
+        const y = parseInt(year)
+        if (!isNaN(y)) {
+          query.year = { $gte: y - 1, $lte: y + 1 }
+        }
+      }
+
+      // 🔒 3. 排除短剧特征 (双重保险)
+      // 如果是找电影(movie)，排除集数过多的
+      // 这里无法直接查集数，但可以利用正则表达式排除 title 里的垃圾词 (虽然 title 已经是完全匹配了)
+      // 或者依赖分类器已经把短剧归类为 'tv' 或 'other' 了，所以 query.category 限制很重要
+      // 🔥 3. 新增：原始分类黑名单校验
+      // 即使标题一样，如果 original_type 是短剧，绝对不要匹配
+      query.original_type = { $not: /短剧|爽文|爽剧|反转|赘婿/ }
+
+      video = await Video.findOne(query).sort({ updatedAt: -1 })
+
+      // 🔥 4. 新增：二次校验 (防止电影匹配到多集短剧)
+      // 如果前端要找的是 movie (category='movie' 或 TMDB判断是电影)
+      // 但数据库里查出来的这货竟然有 > 5 集，那它肯定是假冒的短剧
+      if (
+        video &&
+        (category === "movie" || !video.category || video.category === "movie")
+      ) {
+        const episodeCount = video.vod_play_url
+          ? video.vod_play_url.split("#").length
+          : 0
+        if (episodeCount > 5) {
+          console.log(
+            `[Match] 拦截伪装数据: ${video.title} (集数: ${episodeCount}, 类型: ${video.original_type})`
+          )
+          video = null // 扔掉这个假结果
+        }
+      }
+
+      video = await Video.findOne(query).sort({ updatedAt: -1 })
+    }
+
+    if (video) {
+      return success(res, {
+        found: true,
+        id: video.uniq_id,
+        title: video.title,
+        source: video.source,
+        // 返回集数方便前端判断
+        episodes_count: video.vod_play_url
+          ? video.vod_play_url.split("#").length
+          : 0,
+      })
+    } else {
+      return success(res, { found: false, message: "未找到匹配资源" })
+    }
+  } catch (e) {
+    console.error("Match Error:", e)
+    fail(res, "匹配错误")
+  }
+})
 // 错误处理
 app.use((err, req, res, next) => {
   console.error("Global Error:", err)
