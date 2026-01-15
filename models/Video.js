@@ -13,9 +13,14 @@ const VideoSchema = new mongoose.Schema(
 
     // === 清洗后的展示数据 ===
     title: { type: String, index: true },
+    original_title: String, // 🔥 新增：原名 (例如 "Three Body")
     director: String,
+    writer: String, // 🔥 新增：编剧
     actors: { type: String, index: true },
 
+    country: String, // 🔥 新增：制片国家 (如 "美国", "中国大陆")
+    language: String, // 🔥 新增：对白语言
+    duration: Number, // 🔥 新增：时长 (分钟)
     // ⚠️ 原始分类 (源提供的分类，如 "动作片", "国产剧")
     original_type: String,
 

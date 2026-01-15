@@ -18,6 +18,8 @@ const { exec } = require("child_process")
 const { syncTask } = require("./scripts/sync")
 const cron = require("node-cron")
 const { runEnrichTask } = require("./scripts/enrich")
+// server.js 头部
+const { classifyVideo } = require("./utils/classifier")
 
 // 引入源配置
 const { sources, PRIORITY_LIST } = require("./config/sources")
@@ -168,21 +170,27 @@ if (MONGO_URI) {
 
       // 2. 部署后自动触发采集 (后台运行)
       // ✅ 修改后的写法：延迟 10 秒执行，优先保证 Web 服务存活
-      // setTimeout(() => {
-      //   console.log("⏰ 延迟启动采集任务，防止阻塞启动...")
-      //   runStartupTask()
-      // }, 10000)
       setTimeout(() => {
-        console.log("⏰ 触发启动后自动清洗...")
-        runEnrichTask(true).catch((e) => console.error("清洗任务出错:", e))
-      }, 10000) // 10秒后开始，不影响启动速度
-
-      // 策略 B: 每隔 4 小时检查一次有没有漏网之鱼 (增量清洗)
-      // 如果你有 node-cron，可以用 cron；如果没有，setInterval 也可以
+        console.log("⏰ 启动触发：开始增量采集 + 清洗...")
+        // 先采集最近 6小时的数据
+        syncTask(6).then(() => {
+          // 采集完了，紧接着触发清洗
+          runEnrichTask(false)
+        })
+      }, 5000)
+      // 任务 B: 定时采集 (每 2 小时)
+      // 采集最近 4 小时的数据 (重叠一点时间防止漏抓)
       setInterval(() => {
-        console.log("⏰ 触发定时增量清洗...")
-        runEnrichTask(true).catch((e) => console.error("定时清洗出错:", e))
-      }, 4 * 60 * 60 * 1000) // 4小时一次
+        console.log("⏰ 定时触发：开始增量采集...")
+        syncTask(4).catch((e) => console.error(e))
+      }, 2 * 60 * 60 * 1000)
+
+      // 任务 C: 定时清洗 (每 1 小时)
+      // 负责把刚刚采集进来的"脏数据"洗干净
+      setInterval(() => {
+        console.log("⏰ 定时触发：开始数据清洗...")
+        runEnrichTask(false).catch((e) => console.error(e))
+      }, 1 * 60 * 60 * 1000)
     })
     .catch((err) => console.error("❌ MongoDB Connection Error:", err))
 }
@@ -355,6 +363,11 @@ const cleanYear = (rawYear) => {
 // ==========================================
 const saveToDB = async (item, sourceKey) => {
   try {
+    // 1. 🔥 调用分类器 (核心修改)
+    const classified = classifyVideo(item)
+    // 如果返回 null，说明是黑名单数据（如伦理片），直接丢弃
+    if (!classified) return null
+
     // 1. 基础年份清洗 (即使 TMDB 挂了，这里也能保证年份不乱码)
     let safeYear = parseInt(item.vod_year)
     if (isNaN(safeYear) || safeYear < 1900 || safeYear > 2030) {
@@ -391,8 +404,8 @@ const saveToDB = async (item, sourceKey) => {
       title: title.trim(),
       type_id: typeId,
       type: typeName,
-      category: category,
-      tags: tags, // 基础标签
+      category: classified.category,
+      tags: classified.tags, // 基础标签
 
       poster: item.vod_pic,
       remarks: item.vod_remarks,
@@ -421,7 +434,7 @@ const saveToDB = async (item, sourceKey) => {
       {
         $set: videoData,
         // 仅当是新插入的数据时，确保 tmdb_id 不存在（虽然默认就不存在，但为了保险）
-        $unset: { tmdb_id: "" },
+        $setOnInsert: { tmdb_id: undefined },
       },
       { upsert: true }
     )
