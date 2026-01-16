@@ -49,26 +49,29 @@ app.use((err, req, res, next) => {
   res.status(500).json({ code: 500, message: "Server Internal Error" })
 })
 
-// 6. 🔥🔥🔥 定义智能同步函数 (必须放在调用之前)
+// 6. 智能同步函数
 const checkAndSync = async () => {
   try {
-    // 检查数据库里有多少视频
     const count = await Video.countDocuments()
     console.log(`📊 当前数据库视频数量: ${count}`)
 
-    if (count === 0) {
-      console.log("✨ 检测到数据库为空，自动触发 [全量采集] (100年)...")
-      // 876000 小时 ≈ 100年
-      syncTask(876000)
-        .then(() => {
-          console.log("✅ 全量采集完成，开始触发数据清洗...")
-          // 采集完了顺便清洗一下，保证数据质量
-          runEnrichTask(true)
-        })
-        .catch((e) => console.error("全量采集失败:", e))
+    // 🔥 读取环境变量 (在 Zeabur 变量里设置)
+    // START_PAGE: 从第几页开始跑 (例如 1761)
+    // SYNC_MODE: 'full' 强制跑全量
+    const startPage = process.env.START_PAGE
+      ? parseInt(process.env.START_PAGE)
+      : 1
+    const syncMode = process.env.SYNC_MODE
+
+    if (syncMode === "full") {
+      console.log(`🔥🔥🔥 强制触发 [全量采集] (从第 ${startPage} 页开始)...`)
+      syncTask(876000, startPage).catch((e) => console.error(e))
+    } else if (count === 0) {
+      console.log("✨ 数据库为空，自动触发 [全量采集]...")
+      syncTask(876000, 1).catch((e) => console.error(e))
     } else {
-      console.log("🔄 检测到已有数据，自动触发 [增量采集] (最近6小时)...")
-      syncTask(6).catch((e) => console.error("增量采集失败:", e))
+      console.log("🔄 自动触发 [增量采集] (最近6小时)...")
+      syncTask(6).catch((e) => console.error(e))
     }
   } catch (e) {
     console.error("检查数据库状态失败:", e)
@@ -79,7 +82,9 @@ const checkAndSync = async () => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`)
   // 启动后执行检查
-  checkAndSync()
+  if (process.env.NODE_ENV === "production") {
+    checkAndSync()
+  }
 })
 
 // Cron (定时任务)

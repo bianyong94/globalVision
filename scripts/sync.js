@@ -105,6 +105,36 @@ async function processItem(item, sourceKey) {
 }
 
 // ==========================================
+// 2. 增强版：带重试的 Fetch
+// ==========================================
+const fetchPageWithRetry = async (sourceConfig, page, hours, retries = 3) => {
+  const config = getAxiosConfig()
+
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await axios.get(sourceConfig.url, {
+        params: { ac: "detail", at: "json", pg: page, h: hours },
+        ...config,
+        timeout: 15000, // 15秒超时
+      })
+      return res.data
+    } catch (error) {
+      const isLast = i === retries - 1
+      console.warn(
+        `⚠️ [Network] Page ${page} failed (${i + 1}/${retries}): ${
+          error.message
+        }`
+      )
+
+      if (isLast) throw error // 最后一次还没成功，抛出异常让外层处理
+
+      // 等待 2秒 再重试
+      await new Promise((r) => setTimeout(r, 2000))
+    }
+  }
+}
+
+// ==========================================
 // 2. 采集单页逻辑
 // ==========================================
 const fetchPage = async (sourceConfig, page, hours) => {
@@ -127,86 +157,80 @@ const fetchPage = async (sourceConfig, page, hours) => {
 // ==========================================
 // 3. 单个源同步任务
 // ==========================================
-const syncSourceTask = async (key, hours) => {
+const syncSourceTask = async (key, hours, startPage = 1) => {
   const source = sources[key]
   if (!source) return
 
-  console.log(`\n🚀 [Start] ${source.name} (Last ${hours}h)...`)
+  console.log(
+    `\n🚀 [Start] ${source.name} (Last ${hours}h) starting from Page ${startPage}...`
+  )
 
-  let page = 1
-  let totalPage = 1
+  let page = startPage
+  let totalPage = 9999 // 初始假定
   let stats = { updated: 0, merged: 0, created: 0, skipped: 0 }
 
-  do {
-    const data = await fetchPage(source, page, hours)
-    if (!data || !data.list || data.list.length === 0) break
+  while (page <= totalPage) {
+    try {
+      const data = await fetchPageWithRetry(source, page, hours)
 
-    totalPage = data.pagecount
-    const list = data.list
+      if (!data || !data.list || data.list.length === 0) {
+        console.log("⚠️ No data in list, stopping.")
+        break
+      }
 
-    // ⚠️ 关键修改：不再使用 bulkWrite，而是串行/并发处理
-    // 因为涉及到复杂的“查找->判断->合并”逻辑，bulkWrite 搞不定
-    // 使用 Promise.all 并发处理本页 20 条数据，速度依然很快
-    const results = await Promise.all(
-      list.map((item) => processItem(item, key))
-    )
+      totalPage = data.pagecount
+      const list = data.list
 
-    // 统计结果
-    results.forEach((res) => {
-      if (stats[res]) stats[res]++
-    })
+      // 并发处理本页数据
+      const results = await Promise.all(
+        list.map((item) => processItem(item, key))
+      )
 
-    console.log(
-      `📥 ${source.name} P${page}/${totalPage}: +${stats.created} New, ^${stats.merged} Merged, ~${stats.updated} Upd`
-    )
+      results.forEach((res) => {
+        if (stats[res]) stats[res]++
+      })
 
-    // 简单的防封策略
+      console.log(
+        `📥 ${source.name} P${page}/${totalPage}: +${stats.created} New, ^${stats.merged} Merged, ~${stats.updated} Upd`
+      )
+    } catch (error) {
+      // 🔥🔥🔥 核心容错：如果这一页彻底挂了，记录日志，跳过，继续下一页！
+      console.error(
+        `❌ [Critical Fail] Page ${page} skipped due to error:`,
+        error.message
+      )
+    }
+
+    // 防封 & 继续
     await new Promise((r) => setTimeout(r, 200))
     page++
-  } while (page <= totalPage)
+  }
 
-  console.log(
-    `✅ ${source.name} Done. Created:${stats.created}, Merged:${stats.merged}, Updated:${stats.updated}`
-  )
+  console.log(`✅ ${source.name} Done.`)
 }
 
-// ==========================================
-// 4. 主入口
-// ==========================================
-const syncTask = async (hours = 24 * 5) => {
-  console.log("========================================")
-  console.log(`🔥 智能聚合采集开始 (Time: ${hours}h)`)
-  console.log("========================================")
-
-  // 按照配置文件的优先级顺序采集
-  // 建议把主力源放前面
-  const targetKeys = PRIORITY_LIST // ["maotai", "feifan", ...]
+const syncTask = async (hours = 24, startPage = 1) => {
+  const targetKeys = PRIORITY_LIST
 
   for (const key of targetKeys) {
     try {
       if (sources[key]) {
-        await syncSourceTask(key, hours)
+        await syncSourceTask(key, hours, startPage)
       }
     } catch (e) {
       console.error(`❌ Source ${key} failed:`, e)
     }
   }
-
-  console.log("\n🎉 所有采集任务完成!")
 }
 
-// 命令行支持: node scripts/sync.js 999
+// 命令行支持
 if (require.main === module) {
   const MONGO_URI = process.env.MONGO_URI
-  if (!MONGO_URI) {
-    console.error("❌ 请先配置 .env 文件中的 MONGO_URI")
-    process.exit(1)
-  }
-
   mongoose.connect(MONGO_URI).then(async () => {
+    // 参数1: 小时, 参数2: 起始页码
     const h = process.argv[2] ? parseInt(process.argv[2]) : 24
-    await syncTask(h)
-    console.log("👋 Bye")
+    const p = process.argv[3] ? parseInt(process.argv[3]) : 1
+    await syncTask(h, p)
     process.exit(0)
   })
 }

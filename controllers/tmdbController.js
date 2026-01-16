@@ -1,6 +1,6 @@
 const axios = require("axios")
 const { HttpsProxyAgent } = require("https-proxy-agent")
-const proxyUrl = process.env.PROXY_URL
+const proxyUrl = "http://127.0.0.1:7897"
 const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : null
 
 const success = (res, data) => res.json({ code: 200, message: "success", data })

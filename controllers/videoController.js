@@ -7,10 +7,44 @@ const {
 } = require("../services/videoService")
 const { sources } = require("../config/constants")
 const axios = require("axios")
+const mongoose = require("mongoose")
 
 const success = (res, data) => res.json({ code: 200, message: "success", data })
 const fail = (res, msg = "Error", code = 500) =>
   res.json({ code, message: msg })
+
+// 辅助函数：统一返回格式
+const formatDetail = (video) => {
+  // 如果是聚合模型，sources 是数组
+  // 我们需要确保返回给前端的结构是完整的
+  return {
+    id: video._id, // 核心 ID
+    title: video.title,
+    poster: video.poster,
+    category: video.category,
+    year: video.year,
+    area: video.area,
+    rating: video.rating,
+    content: video.overview || video.content,
+    actors: video.actors,
+    director: video.director,
+    tags: video.tags || [],
+
+    // 🔥 核心：直接返回聚合后的 sources 数组
+    // 如果没有 sources 数组（旧数据），则尝试构造一个兼容的
+    sources:
+      video.sources && video.sources.length > 0
+        ? video.sources
+        : [
+            {
+              source_key: video.source || "unknown",
+              source_name: sources[video.source]?.name || "默认源",
+              vod_play_url: video.vod_play_url,
+              remarks: video.remarks,
+            },
+          ],
+  }
+}
 
 exports.getVideos = async (req, res) => {
   try {
@@ -137,10 +171,15 @@ exports.getVideos = async (req, res) => {
 
     const list = await Video.aggregate(pipeline)
 
+    const formattedList = list.map((item) => ({
+      ...item,
+      id: item._id.toString(), // 或者 item.tmdb_id (如果你想用 tmdb_id 做路由)
+    }))
+
     // ==========================================
     // 4. 返回结果
     // ==========================================
-    res.json({ code: 200, list: list })
+    res.json({ code: 200, list: formattedList })
   } catch (e) {
     console.error("Search API Error:", e)
     res.status(500).json({ code: 500, msg: "Error" })
@@ -225,188 +264,69 @@ exports.getHome = async (req, res) => {
 }
 
 exports.getDetail = async (req, res) => {
-  const { id } = req.params // 例如: "hongniu_951"
+  const { id } = req.params // 可能是 "65a4f..." (_id) 或 "maotai_123" (旧ID)
 
   // 1. 缓存检查 (缓存 10 分钟)
-  // 注意：开发调试时可以注释掉这就行，方便看实时日志
-  const cacheKey = `detail_v4_${id}`
+  const cacheKey = `detail_v5_${id}`
   const cachedData = await getCache(cacheKey)
+
+  // 辅助函数：标准化返回
+  const success = (res, data) =>
+    res.json({ code: 200, message: "success", data })
+  const fail = (res, msg = "Error", code = 500) =>
+    res.json({ code, message: msg })
+
   if (cachedData) return success(res, cachedData)
 
-  // 解析播放列表 (工具函数)
-  const parseEpisodes = (urlStr, fromStr) => {
-    if (!urlStr) return []
-    const froms = (fromStr || "").split("$$$")
-    const urls = urlStr.split("$$$")
-    // 优先找 m3u8，找不到就找默认的
-    let idx = froms.findIndex((f) => f && f.toLowerCase().includes("m3u8"))
-    if (idx === -1) idx = 0
-    const targetUrl = urls[idx] || ""
-    if (!targetUrl) return []
-
-    return targetUrl.split("#").map((ep) => {
-      const parts = ep.split("$")
-      return {
-        name: parts.length > 1 ? parts[0] : "正片",
-        link: parts.length > 1 ? parts[1] : parts[0],
-      }
-    })
-  }
-
   try {
-    let videoDetail = null
-    let sourceKey = ""
-    let vodId = ""
+    let video = null
 
     // ==========================================
-    // 步骤 A: 解析 ID，确定要查询的源
+    // 步骤 A: 优先尝试 MongoDB _id 查询 (新架构标准)
     // ==========================================
-    if (id.includes("_") || id.includes("$")) {
-      const separator = id.includes("_") ? "_" : "$"
-      const parts = id.split(separator)
-      sourceKey = parts[0] // "hongniu"
-      vodId = parts[1] // "951"
-    } else {
-      // 兼容旧 ID (纯数字)，默认去非凡查，或者查库
-      const exist = await Video.findOne({ vod_id: id })
-      if (exist) {
-        sourceKey = exist.source
-        vodId = String(exist.vod_id)
-      } else {
-        sourceKey = "feifan" // 默认兜底
-        vodId = id
-      }
+    // 只有当 id 是 24位 hex 字符串时才尝试，避免报错
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      video = await Video.findById(id)
     }
 
     // ==========================================
-    // 步骤 B: 尝试从数据库获取
+    // 步骤 B: 如果没找到，尝试兼容旧 ID 查询
     // ==========================================
-    // 构造查询条件：同时匹配源和ID，防止ID冲突
-    videoDetail = await Video.findOne({
-      $or: [
-        { uniq_id: `${sourceKey}_${vodId}` }, // 新格式
-        { uniq_id: `${sourceKey}$${vodId}` }, // 旧格式
-        { id: `${sourceKey}_${vodId}` }, // 兼容格式
-      ],
-    })
-
-    // ==========================================
-    // 步骤 C: 数据库没有 -> 触发回源采集 (关键修复)
-    // ==========================================
-    if (!videoDetail) {
-      console.log(
-        `🚀 [Detail] DB Miss, Fetching Remote: ${sourceKey} -> ${vodId}`
-      )
-
-      // 1. 检查源是否存在于配置中
-      const targetSource = sources[sourceKey]
-      if (!targetSource) {
-        return fail(res, `未知的资源站标识: ${sourceKey}`, 400)
-      }
-
-      try {
-        // 2. 发起请求 (不使用 smartFetch 的自动竞速，而是强制指定源)
-        // ⚠️ 红牛等源速度极慢，给予 8秒 超时
-        const response = await axios.get(targetSource.url, {
-          params: { ac: "detail", at: "json", ids: vodId },
-          timeout: 8000,
-          ...getAxiosConfig(),
-        })
-
-        // 3. 校验返回数据
-        if (
-          response.data &&
-          response.data.list &&
-          response.data.list.length > 0
-        ) {
-          const rawData = response.data.list[0]
-          // 4. 存入数据库 (异步)
-          // 必须 await 确保 videoDetail 被赋值
-          videoDetail = await saveToDB(rawData, sourceKey)
-          console.log(`✅ [Detail] Saved to DB: ${videoDetail.title}`)
-        } else {
-          console.warn(
-            `⚠️ [Detail] Remote API returned empty list: ${sourceKey}`
-          )
-          return fail(res, "源站返回数据为空，可能资源已失效", 404)
-        }
-      } catch (fetchErr) {
-        console.error(
-          `❌ [Detail] Fetch Failed (${sourceKey}):`,
-          fetchErr.message
-        )
-        return fail(res, `源站连接超时或错误: ${fetchErr.message}`, 500)
-      }
+    if (!video) {
+      // 旧逻辑：可能是 "maotai_12345" 这种格式
+      // 或者在 sources 数组里查找子文档的 vod_id
+      video = await Video.findOne({
+        $or: [
+          { uniq_id: id }, // 匹配旧版 Flat 数据
+          { "sources.vod_id": id }, // 匹配聚合后的子资源 ID
+          { custom_id: id }, // 匹配自定义 ID (如果有)
+        ],
+      })
     }
 
-    // 双重检查
-    if (!videoDetail) return fail(res, "资源解析失败", 500)
-
     // ==========================================
-    // 步骤 D: 构建“可用源”列表 (混合模式)
+    // 步骤 C: 还是没找到？ -> 404
     // ==========================================
-
-    // 1. 数据库里的同名资源 (已采集的)
-    const siblings = await Video.find({
-      title: videoDetail.title,
-    }).select("uniq_id source remarks")
-
-    // 2. 配置文件里的所有源 (静态的)
-    // 我们把配置文件里的源也都列出来，方便前端展示“去搜索”按钮
-    // 这里的逻辑是：结合数据库已有的状态，生成一个完整的列表
-    const allConfiguredSources = Object.keys(sources).map((key) => {
-      const sourceConfig = sources[key]
-      // 查找数据库里是否已经有这个源的数据
-      const existing = siblings.find((s) => s.source === key)
-
-      return {
-        key: key,
-        name: sourceConfig.name,
-        // 如果库里有，就用库里的ID；如果库里没有，前端点击时需要触发“全网搜”
-        id: existing ? existing.uniq_id : null,
-        remarks: existing ? existing.remarks : "点击搜索",
-        is_active: key === sourceKey, // 标记是否是当前播放的源
-        has_data: !!existing, // 标记库里是否有数据
-      }
-    })
-
-    // ==========================================
-    // 步骤 E: 返回最终数据
-    // ==========================================
-    const responseData = {
-      id: videoDetail.uniq_id, // 核心 ID
-      uniq_id: videoDetail.uniq_id,
-
-      title: videoDetail.title,
-      pic: videoDetail.poster || videoDetail.pic,
-      year: videoDetail.year,
-      area: videoDetail.area,
-      content: videoDetail.overview || videoDetail.content,
-      actors: videoDetail.actors,
-      director: videoDetail.director,
-      category: videoDetail.category,
-      tags: videoDetail.tags,
-
-      // 播放列表
-      episodes: parseEpisodes(
-        videoDetail.vod_play_url,
-        videoDetail.vod_play_from
-      ),
-
-      // 🔥 修复后的源列表 (包含所有配置源)
-      available_sources: allConfiguredSources,
-
-      current_source: {
-        key: videoDetail.source,
-        name: sources[videoDetail.source]?.name || videoDetail.source,
-      },
+    // ⚠️ 我们已经移除了“回源采集”逻辑，因为：
+    // 1. 你现在是全量采集模式，数据库理应有数据。
+    // 2. 拿 MongoDB ID 去请求资源站接口会导致 crash。
+    // 3. 避免了恶意用户乱输 ID 导致服务器卡顿。
+    if (!video) {
+      console.warn(`⚠️ [Detail] Not Found: ${id}`)
+      return fail(res, "资源未找到或已下架", 404)
     }
+
+    // ==========================================
+    // 步骤 D: 格式化数据并返回
+    // ==========================================
+    const result = formatDetail(video)
 
     // 写入缓存
-    await setCache(cacheKey, responseData, 600)
-    success(res, responseData)
+    await setCache(cacheKey, result, 600)
+
+    success(res, result)
   } catch (e) {
-    console.error("🔥 Global Detail Error:", e)
+    console.error(`🔥 [Detail] Error processing ID: ${id}`, e)
     fail(res, "服务器内部错误: " + e.message)
   }
 }
