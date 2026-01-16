@@ -1,72 +1,111 @@
-// models/Video.js
 const mongoose = require("mongoose")
 
+// 定义子文档：资源源 (Source)
+// 这是为了实现“一部电影，多个播放源”的核心结构
+const SourceSchema = new mongoose.Schema({
+  source_key: { type: String, required: true }, // 源标识，如 "hongniu", "feifan"
+  vod_id: { type: String, required: true }, // 采集站那边的 ID
+  vod_name: String, // 采集站那边的标题 (用于对比)
+  vod_play_from: String, // 播放器类型 (如 "m3u8", "ddzy")
+  vod_play_url: { type: String, required: true }, // 播放列表字符串
+  remarks: String, // 更新状态 (如 "更新至10集", "HD中字")
+  priority: { type: Number, default: 0 }, // 优先级 (比如清洗过的高清源排前面)
+  updatedAt: { type: Date, default: Date.now }, // 该源最后更新时间
+})
+
+// 主文档：影视条目 (Video)
 const VideoSchema = new mongoose.Schema(
   {
-    // 核心唯一ID：格式为 "sourceKey_vod_id" (例如 "maotai_12345")
-    // ⚠️ 改名 uniq_id 以区分 MongoDB 自身的 _id，防止混淆
-    uniq_id: { type: String, required: true, unique: true, index: true },
+    // ==========================================
+    // 1. 核心身份认证 (Identity)
+    // ==========================================
+    // TMDB ID 是聚合的核心。unique: true 保证同一个电影数据库里只有一条记录
+    tmdb_id: { type: Number, unique: true, index: true, sparse: true },
 
-    // === 原始数据 (保留用于排查) ===
-    vod_id: Number,
-    source: String, // 数据源标识 (maotai, feifan)
+    // 如果没有 TMDB ID (比如某些微短剧)，用这个作为备用唯一标识
+    // 格式建议: "custom_MD5(title+year)" 或直接用 MongoDB _id
+    custom_id: { type: String, index: true, sparse: true },
 
-    // === 清洗后的展示数据 ===
-    title: { type: String, index: true },
-    original_title: String, // 🔥 新增：原名 (例如 "Three Body")
-    director: String,
-    writer: String, // 🔥 新增：编剧
-    actors: { type: String, index: true },
+    // ==========================================
+    // 2. 展示元数据 (Metadata) - 以 TMDB 为准
+    // ==========================================
+    title: { type: String, required: true, index: true }, // 标准中文名
+    original_title: String, // 原名 (英文/日文)
 
-    country: String, // 🔥 新增：制片国家 (如 "美国", "中国大陆")
-    language: String, // 🔥 新增：对白语言
-    duration: Number, // 🔥 新增：时长 (分钟)
-    // ⚠️ 原始分类 (源提供的分类，如 "动作片", "国产剧")
-    original_type: String,
+    // 你的 Server.js 强依赖这些字段进行筛选
+    category: {
+      type: String,
+      required: true,
+      enum: ["movie", "tv", "anime", "variety", "sports", "other"], // 规范化分类
+      index: true,
+    },
 
-    // 🔥🔥🔥 核心升级：标准大类 (用于底部 Tab)
-    // 枚举值: movie(电影), tv(剧集), anime(动漫), variety(综艺), doc(纪录片), sports(体育)
-    category: { type: String, index: true, required: true },
+    year: { type: Number, index: true }, // 年份 (2024)
+    date: String, // 具体上映日期 (2024-05-16)
 
-    // 🔥🔥🔥 核心升级：智能标签 (用于首页金刚区、Netflix专区等)
-    // 例如: ["netflix", "4k", "悬疑", "古装", "高分", "2024"]
+    // 丰富详情 (保留你之前的定义)
+    actors: { type: String, index: true }, // 演员字符串 "张若昀, 李沁"
+    director: String, // 导演
+    writer: String, // 编剧
+    area: String, // 地区 "中国大陆"
+    language: String, // 语言
+    duration: String, // 时长
+
+    overview: String, // 简介
+
+    // 图片系统
+    poster: String, // 竖版海报 (TMDB Link)
+    backdrop: String, // 横版大图 (用于首页 Banner)
+
+    // ==========================================
+    // 3. 核心功能字段 (Logic)
+    // ==========================================
+    // 评分系统
+    rating: { type: Number, default: 0, index: true }, // TMDB 评分
+    vote_count: { type: Number, default: 0 }, // 评分人数 (防止只有1个人评10分)
+
+    // 🔥 标签系统 (用于 "Netflix", "4K", "短剧" 筛选)
     tags: { type: [String], index: true },
 
-    poster: String,
-    overview: String,
-    language: String,
-    area: String,
-    year: Number, // 格式化为数字方便排序
-    date: String, // 原始更新时间字符串
+    // 状态标记
+    is_enriched: { type: Boolean, default: false }, // 是否已完成 TMDB 精修
+    is_locked: { type: Boolean, default: false }, // 是否人工锁定 (防止被采集脚本覆盖)
 
-    // 评分：如果没有评分，默认为 0
-    rating: { type: Number, default: 0, index: true },
+    // ==========================================
+    // 4. 资源聚合挂载点 (Aggregation)
+    // ==========================================
+    // 这里不再存单独的 vod_play_url，而是存一个数组
+    sources: [SourceSchema],
 
-    remarks: String, // 连载状态
-
-    // 播放地址
-    vod_play_from: String,
-    vod_play_url: String,
-    tmdb_id: { type: Number, index: true },
-
-    // 系统更新时间
-    updatedAt: { type: Date, default: Date.now },
+    // 辅助字段：最新更新的源的 remarks (方便列表页显示 "更新至8集")
+    latest_remarks: String,
   },
   {
-    timestamps: true, // 自动管理 createdAt 和 updatedAt
+    timestamps: true, // 自动维护 createdAt, updatedAt
+    minimize: false, // 防止空对象被忽略
   }
 )
 
-// 复合文本索引 (用于全文搜索)
+// ==========================================
+// 5. 索引优化 (Indexing)
+// ==========================================
+
+// 列表页筛选常用组合
+VideoSchema.index({ category: 1, year: -1, rating: -1 })
+VideoSchema.index({ category: 1, tags: 1, updatedAt: -1 })
+
+// 搜索优化 (支持 标题、演员、导演、原名 搜索)
+// 注意：MongoDB Text Search 对中文支持一般，建议结合 regex 使用
 VideoSchema.index(
-  { title: "text", actors: "text", original_type: "text" },
   {
-    // 👇 关键：指定一个不存在的字段名，或者是 "none"
-    // 这样 MongoDB 就不会去读取你的 'language' 字段了
-    language_override: "dummy_language_field",
+    title: "text",
+    original_title: "text",
+    actors: "text",
+    director: "text",
+  },
+  {
+    weights: { title: 10, original_title: 5, actors: 3, director: 1 },
   }
 )
-// 复合查询索引 (用于类似 "找美剧+悬疑+按时间排序" 的查询)
-VideoSchema.index({ category: 1, tags: 1, updatedAt: -1 })
-VideoSchema.index({ tmdb_id: 1 })
+
 module.exports = mongoose.model("Video", VideoSchema)
