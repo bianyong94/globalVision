@@ -45,7 +45,7 @@ module.exports = {
   CATEGORY_RELATIONS,
 
   // 优先级列表 (搜索排序用)
-  PRIORITY_LIST: ["maotai", "feifan", "liangzi", "hongniu"],
+  PRIORITY_LIST: ["maotai"],
 
   sources: {
     // ===========================
