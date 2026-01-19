@@ -63,15 +63,29 @@ const checkAndSync = async () => {
       : 1
     const syncMode = process.env.SYNC_MODE
 
-    if (syncMode === "full") {
-      console.log(`🔥🔥🔥 强制触发 [全量采集] (从第 ${startPage} 页开始)...`)
-      syncTask(876000, startPage).catch((e) => console.error(e))
-    } else if (count === 0) {
+    // if (syncMode === "full") {
+    //   console.log(`🔥🔥🔥 强制触发 [全量采集] (从第 ${startPage} 页开始)...`)
+    //   syncTask(876000, startPage).catch((e) => console.error(e))
+    // }
+    if (count === 0) {
       console.log("✨ 数据库为空，自动触发 [全量采集]...")
       syncTask(876000, 1).catch((e) => console.error(e))
     } else {
       console.log("🔄 自动触发 [增量采集] (最近6小时)...")
       syncTask(6).catch((e) => console.error(e))
+    }
+
+    const dirtyCount = await Video.countDocuments({
+      is_enriched: false,
+      tmdb_id: { $ne: -1 },
+    })
+
+    if (dirtyCount > 0) {
+      console.log(`🧹 发现 ${dirtyCount} 条未清洗数据，启动后台清洗任务...`)
+      // 不使用 await，让它在后台慢慢跑，不要阻塞 Server 启动太久
+      runEnrichTask(false).catch((e) => console.error("清洗任务出错:", e))
+    } else {
+      console.log("✅ 所有数据已清洗")
     }
   } catch (e) {
     console.error("检查数据库状态失败:", e)
