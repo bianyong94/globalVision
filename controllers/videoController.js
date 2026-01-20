@@ -56,7 +56,7 @@ exports.getVideos = async (req, res) => {
     // 1. 构建筛选条件 ($match)
     // ==========================================
     const matchStage = {}
-    let sortStage = { updatedAt: -1 }
+
     // 🔍 关键词搜索
     if (wd) {
       const regex = new RegExp(wd, "i")
@@ -82,77 +82,61 @@ exports.getVideos = async (req, res) => {
       matchStage.year = parseInt(year)
     }
 
-    // 🏷️ 标签筛选
+    // ==========================================
+    // 2. 标签与特殊模式逻辑
+    // ==========================================
     if (tag) {
-      matchStage.tags = tag
-      // 如果是找“高分”或“豆瓣榜单”，必须过滤掉 0 分的垃圾数据
-      if (tag === "high_score") {
-        matchStage.rating = { $gt: 0 }
+      const lowerTag = tag.toLowerCase()
+
+      if (lowerTag === "high_score") {
+        // 🏆 高分榜单模式 (严格)
+        // 1. 评分必须 >= 7.5
+        matchStage.rating = { $gte: 7.5 }
+        // 2. 必须有一定评分人数 (防止只有1人评10分的片子)
+        matchStage.vote_count = { $gte: 20 }
+        // 3. 必须是清洗过的数据
+        matchStage.tmdb_id = { $exists: true }
+      } else if (lowerTag === "netflix") {
+        // 🎬 Netflix 模式 (忽略大小写)
+        matchStage.tags = { $in: ["Netflix", "netflix", "NETFLIX"] }
+      } else if (["4k", "2160p"].includes(lowerTag)) {
+        // 💎 4K 模式
+        matchStage.tags = { $in: ["4K", "4k", "2160P"] }
+      } else {
+        // 🏷️ 普通标签 (通用正则匹配，忽略大小写)
+        matchStage.tags = { $regex: new RegExp(`^${tag}$`, "i") }
       }
     }
 
     // ==========================================
-    // 2. 构建智能排序逻辑 ($sort) 🔥 核心修改
+    // 3. 构建排序逻辑 ($sort)
     // ==========================================
+    let sortStage = {}
 
-    if (sort === "rating" || tag === "high_score" || tag === "高分电影") {
-      // 1. 评分必须大于 0 (排除未评分的)
-      matchStage.rating = { $gt: 0 }
+    // 优先处理明确的排序指令
+    if (sort === "rating" || (tag && tag.toLowerCase() === "high_score")) {
+      // ⭐ 按评分排序
+      sortStage = { rating: -1, year: -1, updatedAt: -1 }
 
-      // 1. 强制只看 TMDB 清洗过的数据 (关键！排除采集站的假 10 分)
-      matchStage.tmdb_id = { $exists: true }
-
-      // 2. 强制评分门槛 (例如大于 7.0 分)
-      matchStage.rating = { $gt: 6.5 }
-      if (!cat || cat === "all") {
-        matchStage.category = "movie"
-      }
-
-      // ✅ 场景 A: 用户想看【高分】
-      // 逻辑：先看分数 -> 分数一样看年份(越新越好) -> 年份一样看更新时间
-      sortStage = {
-        rating: -1, // 1. 评分优先 (10分 > 9分)
-        year: -1, // 2. 年份次之 (同9分，2025 > 1990)
-        updatedAt: -1, // 3. 更新时间兜底 (同分同年，刚更新的在前后)
-      }
-
-      // 再次确保，按评分排时，如果没有筛选 rating>0，这里强制过滤 0 分
-      // 避免 0 分的数据因为 year 很大而混在中间（虽然 sort rating:-1 会把 0 放最后，但为了保险）
+      // 🛡️ 兜底：如果用户没选 high_score 标签，只是点了排序按钮
+      // 我们也要过滤掉 0 分的数据，否则排序会很乱
       if (!matchStage.rating) {
         matchStage.rating = { $gt: 0 }
       }
-    } else if (tag === "netflix") {
-      matchStage.tags = "netflix"
-      // Netflix 专区也建议优先展示清洗过的数据
-      // matchStage.tmdb_id = { $exists: true };
-    } else if (tag === "4k") {
-      matchStage.tags = { $in: ["4K", "4k"] }
-    } else {
-      // ✅ 场景 B: 用户想看【最新】(默认)
-      // 逻辑：先看年份 -> 年份一样看更新时间(集数更新) -> 都一样看评分(质量)
-      sortStage = {
-        year: -1, // 1. 绝对年份优先 (2026 > 2025)
-        updatedAt: -1, // 2. 也是2025，刚更新第16集的排在第10集前面
-        rating: -1, // 3. 都是2025且同时更新，9.0分的排在2.0分前面
+      // 建议：即使是手动排序，也最好过滤掉极少人评分的
+      if (!matchStage.vote_count) {
+        matchStage.vote_count = { $gt: 0 } // 至少有人评过分
       }
-    }
-
-    // 📶 排序参数处理 (sort 参数)
-    if (sort === "rating") {
-      // 🔥 如果用户手动点击了 "按评分"，也必须过滤垃圾数据
-      // 2. 🔥🔥🔥 新增：评分人数必须超过一定数量 (例如 20人 或 50人)
-      // 这样能过滤掉只有几个人评分的冷门/野鸡片，把真正的高分大片显露出来
-      // 注意：确保你的数据库里有 vote_count 字段 (最新的 enrich.js 已经包含此字段)
-      matchStage.vote_count = { $gte: 20 }
-      matchStage.tmdb_id = { $exists: true } // 必须有 TMDB ID
-      matchStage.rating = { $gt: 0 } // 分数必须大于 0
-      sortStage = { rating: -1, year: -1 }
     } else if (sort === "year") {
+      // 📅 按年份排序
       sortStage = { year: -1, updatedAt: -1 }
+    } else {
+      // 🕒 默认：按更新时间 (最新入库/更新的在前面)
+      sortStage = { updatedAt: -1 }
     }
 
     // ==========================================
-    // 3. 执行聚合查询 (Aggregation)
+    // 4. 执行聚合查询 (Aggregation)
     // ==========================================
     const pipeline = [
       { $match: matchStage }, // 1. 筛选
@@ -161,30 +145,43 @@ exports.getVideos = async (req, res) => {
       { $limit: limit }, // 4. 限制数量
       {
         $project: {
-          // 5. 输出字段 (精简数据量)
+          // 5. 输出字段控制 (只取需要的，减少传输量)
+          _id: 1, // 必须取 _id，后面才能转换
           title: 1,
           poster: 1,
           rating: 1,
           year: 1,
           remarks: 1,
           tags: 1,
-          uniq_id: 1,
           category: 1,
-          updatedAt: 1, // 输出这个方便调试看排序是否生效
-          id: "$uniq_id", // 别名映射，前端展示需要 id
+          updatedAt: 1,
+          // 如果需要判断来源，可取 sources
+          // sources: 1
         },
       },
     ]
 
     const list = await Video.aggregate(pipeline)
 
+    // ==========================================
+    // 5. 数据格式化 (清洗返回给前端的数据)
+    // ==========================================
     const formattedList = list.map((item) => ({
       ...item,
-      id: item._id.toString(), // 或者 item.tmdb_id (如果你想用 tmdb_id 做路由)
+      // 🆔 ID 映射：把 MongoDB 的 _id 对象转为字符串 id
+      id: item._id.toString(),
+      // 🧹 移除 _id 防止前端混淆 (可选)
+      _id: undefined,
+
+      // ⭐ 评分格式化：保留1位小数 (7.56 -> 7.6, 8 -> 8.0由前端处理或保持8)
+      rating: item.rating ? parseFloat(item.rating.toFixed(1)) : 0,
+
+      // 📅 年份防呆：如果是 2026 这种未来年份，如果不希望显示，可以在这里处理
+      // year: item.year > new Date().getFullYear() + 1 ? 0 : item.year
     }))
 
     // ==========================================
-    // 4. 返回结果
+    // 6. 返回结果
     // ==========================================
     res.json({ code: 200, list: formattedList })
   } catch (e) {
@@ -377,7 +374,7 @@ exports.searchSources = async (req, res) => {
             // 完全相等，或者包含关系(容错)
             item.vod_name === title ||
             (item.vod_name.includes(title) &&
-              item.vod_name.length < title.length + 2)
+              item.vod_name.length < title.length + 2),
         )
 
         if (match) {
@@ -420,8 +417,14 @@ exports.searchSources = async (req, res) => {
 }
 
 exports.matchResource = async (req, res) => {
-  // 1. 接收参数增加 year (年份)
+  // 1. 接收参数
   const { tmdb_id, category, title, year } = req.query
+
+  // 辅助函数：统一返回成功/失败 (假设您已在 controller 顶部定义)
+  const success = (res, data) =>
+    res.json({ code: 200, message: "success", data })
+  const fail = (res, msg = "Error", code = 500) =>
+    res.json({ code, message: msg })
 
   if (!tmdb_id && !title) {
     return fail(res, "缺少匹配参数", 400)
@@ -430,9 +433,12 @@ exports.matchResource = async (req, res) => {
   try {
     let video = null
 
-    // 🎯 策略 A: TMDB ID 精准匹配 (最稳)
+    // ==========================================
+    // 🎯 策略 A: TMDB ID 精准匹配 (最优先)
+    // ==========================================
     if (tmdb_id) {
       const tmdbIdNum = parseInt(tmdb_id)
+      // 同时尝试数字类型和原始字符串类型查找
       if (!isNaN(tmdbIdNum)) {
         video = await Video.findOne({ tmdb_id: tmdbIdNum })
       }
@@ -441,7 +447,9 @@ exports.matchResource = async (req, res) => {
       }
     }
 
-    // 🔎 策略 B: 标题兜底匹配 (必须加入年份校验！)
+    // ==========================================
+    // 🔎 策略 B: 标题 + 年份 + 分类 兜底匹配
+    // ==========================================
     if (!video && title) {
       console.log(`[Match] 尝试标题匹配: ${title} (${year || "无年份"})`)
 
@@ -452,9 +460,8 @@ exports.matchResource = async (req, res) => {
         query.category = category
       }
 
-      // 🔒 2. 年份模糊校验 (关键修复！)
-      // 如果前端传了年份 (比如 1972)，我们只匹配 1971-1973 之间的数据
-      // 防止匹配到 2024 年的同名短剧
+      // 🔒 2. 年份模糊校验 (误差容忍 ±1年)
+      // 防止匹配到不同年代的同名翻拍剧
       if (year) {
         const y = parseInt(year)
         if (!isNaN(y)) {
@@ -462,53 +469,73 @@ exports.matchResource = async (req, res) => {
         }
       }
 
-      // 🔒 3. 排除短剧特征 (双重保险)
-      // 如果是找电影(movie)，排除集数过多的
-      // 这里无法直接查集数，但可以利用正则表达式排除 title 里的垃圾词 (虽然 title 已经是完全匹配了)
-      // 或者依赖分类器已经把短剧归类为 'tv' 或 'other' 了，所以 query.category 限制很重要
-      // 🔥 3. 新增：原始分类黑名单校验
-      // 即使标题一样，如果 original_type 是短剧，绝对不要匹配
-      query.original_type = { $not: /短剧|爽文|爽剧|反转|赘婿/ }
+      // 🔒 3. 原始分类黑名单过滤 (排除短剧特征)
+      query.original_type = { $not: /短剧|爽文|爽剧|反转|赘婿|战神|重生/ }
 
+      // 执行查询，按更新时间排序取最新的一个
       video = await Video.findOne(query).sort({ updatedAt: -1 })
 
-      // 🔥 4. 新增：二次校验 (防止电影匹配到多集短剧)
-      // 如果前端要找的是 movie (category='movie' 或 TMDB判断是电影)
-      // 但数据库里查出来的这货竟然有 > 5 集，那它肯定是假冒的短剧
-      if (
-        video &&
-        (category === "movie" || !video.category || video.category === "movie")
-      ) {
-        const episodeCount = video.vod_play_url
-          ? video.vod_play_url.split("#").length
-          : 0
-        if (episodeCount > 5) {
+      // 🔥 4. 二次逻辑校验 (安全性防御)
+      if (video) {
+        // A. 如果前端要找的是电影 (movie)，但数据库里这个资源集数 > 5，判定为伪装成电影的短剧
+        const checkUrl =
+          video.sources?.[0]?.vod_play_url || video.vod_play_url || ""
+        const episodeCount = checkUrl ? checkUrl.split("#").length : 0
+
+        if (
+          (category === "movie" || video.category === "movie") &&
+          episodeCount > 5
+        ) {
           console.log(
-            `[Match] 拦截伪装数据: ${video.title} (集数: ${episodeCount}, 类型: ${video.original_type})`
+            `[Match] 拦截疑似短剧数据: ${video.title} (集数: ${episodeCount})`,
           )
-          video = null // 扔掉这个假结果
+          video = null // 舍弃错误匹配
         }
       }
-
-      video = await Video.findOne(query).sort({ updatedAt: -1 })
     }
 
+    // ==========================================
+    // 🚀 结果处理与数据提取 (适配聚合模型)
+    // ==========================================
     if (video) {
-      return success(res, {
-        found: true,
-        id: video.uniq_id,
-        title: video.title,
-        source: video.source,
-        // 返回集数方便前端判断
-        episodes_count: video.vod_play_url
-          ? video.vod_play_url.split("#").length
-          : 0,
-      })
-    } else {
-      return success(res, { found: false, message: "未找到匹配资源" })
+      // 1. 获取集数 (优先从聚合的 sources 数组获取，兼容旧 flat 模型)
+      let finalEpisodeCount = 0
+      let finalPlayFrom = "unknown"
+
+      if (video.sources && video.sources.length > 0) {
+        // 取第一个可用源进行计算
+        const firstSource = video.sources[0]
+        finalPlayFrom = firstSource.source_key
+        finalEpisodeCount = firstSource.vod_play_url
+          ? firstSource.vod_play_url.split("#").length
+          : 0
+      } else if (video.vod_play_url) {
+        // 兼容旧格式数据
+        finalPlayFrom = video.source || "unknown"
+        finalEpisodeCount = video.vod_play_url.split("#").length
+      }
+
+      // 2. 只有当确实有播放链接时才返回 true
+      if (finalEpisodeCount > 0) {
+        return success(res, {
+          found: true,
+          // 🔥 关键：返回 MongoDB _id，确保前端 detail 接口能查到
+          id: video._id.toString(),
+          title: video.title,
+          source: finalPlayFrom,
+          episodes_count: finalEpisodeCount,
+          year: video.year,
+        })
+      }
     }
+
+    // 没找到或无有效播放源
+    return success(res, {
+      found: false,
+      message: "本地库暂未收录该资源或链接失效",
+    })
   } catch (e) {
     console.error("Match Error:", e)
-    fail(res, "匹配错误")
+    return fail(res, "匹配过程发生异常: " + e.message)
   }
 }
