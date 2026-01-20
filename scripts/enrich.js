@@ -7,142 +7,111 @@ const Video = require("../models/Video")
 // 1. 配置
 // ==========================================
 const TMDB_TOKEN = process.env.TMDB_TOKEN
-if (!TMDB_TOKEN) {
-  console.error("❌ 环境变量 TMDB_TOKEN 未配置")
-  process.exit(1)
-}
-
-// Zeabur 直连 TMDB
+// 增加超时设置到 8秒，防止请求挂起太久
 const tmdbApi = axios.create({
   baseURL: "https://api.themoviedb.org/3",
   headers: { Authorization: `Bearer ${TMDB_TOKEN}` },
   params: { language: "zh-CN" },
-  timeout: 10000,
+  timeout: 8000,
 })
 
-// 并发数控制 (建议 5)
-const limit = pLimit(5)
+// 降低并发到 3，求稳不求快，防止 TMDB 报错
+const limit = pLimit(3)
 
-// ==========================================
-// 2. 校验逻辑
-// ==========================================
 function isYearSafe(localYear, tmdbDateStr) {
-  if (!localYear || localYear === 0) return true // 本地无年份，宽容放行
+  if (!localYear || localYear === 0) return true
   if (!tmdbDateStr) return false
   const tmdbYear = parseInt(tmdbDateStr.substring(0, 4))
-  return Math.abs(localYear - tmdbYear) <= 1 // 误差 ±1年
+  return Math.abs(localYear - tmdbYear) <= 1
 }
 
 // ==========================================
-// 3. 核心：兜底与忽略逻辑 (修复报错的关键)
+// 2. 核心：兜底与忽略
 // ==========================================
 
-/**
- * 🔥 核心兜底函数
- * 逻辑：匹配失败时，如果有旧ID就保留（防止变黑户），没有就标记忽略（防止死循环）
- */
-async function keepOldOrIgnore(video, reason = "") {
+// 标记为已完成 (无论成功失败，都调用这个)
+async function markAsDone(id, reason = "") {
   try {
-    // 检查 video.tmdb_id 是否存在且是一个有效的正数
-    // 注意：之前可能存过 -1，我们要把它视为无效
-    if (video.tmdb_id && video.tmdb_id !== -1) {
-      // console.log(`🛡️ [兜底] ${reason} -> 保留旧ID: ${video.tmdb_id}`);
-      // 只更新状态，不改动 tmdb_id
-      await Video.updateOne({ _id: video._id }, { $set: { is_enriched: true } })
-    } else {
-      // console.log(`🗑️ [忽略] ${reason} -> 标记为已处理`);
-      await markAsIgnored(video._id)
+    // 这里的逻辑是：只要跑过一次，就标记 is_enriched=true
+    // 如果之前有 tmdb_id 就留着，没有就没有，绝不删除旧 ID
+    if (reason) {
+      // console.log(`⚠️ [跳过] ${reason}`);
     }
+    await Video.updateOne({ _id: id }, { $set: { is_enriched: true } })
   } catch (e) {
-    console.error(`❌ 兜底处理失败: ${e.message}`)
+    console.error(`❌ 状态更新失败: ${e.message}`)
   }
 }
 
-/**
- * 标记为忽略
- * 🔥 修复重点：不再写入 tmdb_id: -1，而是直接 $unset 删除该字段
- * 配合 Sparse 索引，可以彻底解决 E11000 duplicate key error
- */
 async function markAsIgnored(id) {
   try {
+    // 只有确定是垃圾数据时，才删除 ID
     await Video.updateOne(
       { _id: id },
-      {
-        $set: { is_enriched: true }, // 标记为洗过了
-        $unset: { tmdb_id: "" }, // 删掉 ID 字段，避免冲突
-      }
+      { $set: { is_enriched: true }, $unset: { tmdb_id: "" } }
     )
-  } catch (e) {
-    if (e.code !== 11000) console.error(`标记忽略失败: ${e.message}`)
-  }
+  } catch (e) {}
 }
 
 // ==========================================
-// 4. 单条清洗逻辑
+// 3. 单条清洗逻辑
 // ==========================================
 async function enrichSingleVideo(video) {
   const rawTitle = video.title || ""
 
-  // A. 垃圾数据熔断
-  if (/短剧|爽文|爽剧|反转|赘婿|战神|逆袭|重生|写真|福利/.test(rawTitle)) {
-    await markAsIgnored(video._id)
-    return
-  }
-
-  // B. 标题预处理
-  const cleanTitle = rawTitle
-    .replace(/第[0-9一二三四五六七八九十]+[季部]/g, "")
-    .replace(/S[0-9]+/i, "")
-    .replace(/1080P|4K|HD|BD|中字|双语|国语|未删减|完整版|蓝光/gi, "")
-    .replace(/[\[\(（].*?[\]\)）]/g, "")
-    .trim()
-
-  if (!cleanTitle) {
-    await keepOldOrIgnore(video, "标题为空")
-    return
-  }
-
+  // 🔥🔥🔥 全局 Try-Catch：确保任何错误都不会导致死循环
   try {
+    // A. 垃圾数据熔断
+    if (/短剧|爽文|爽剧|反转|赘婿|战神|逆袭|重生|写真|福利/.test(rawTitle)) {
+      await markAsIgnored(video._id)
+      return
+    }
+
+    // B. 标题预处理
+    const cleanTitle = rawTitle
+      .replace(/第[0-9一二三四五六七八九十]+[季部]/g, "")
+      .replace(/S[0-9]+/i, "")
+      .replace(/1080P|4K|HD|BD|中字|双语|国语|未删减|完整版|蓝光/gi, "")
+      .replace(/[\[\(（].*?[\]\)）]/g, "")
+      .trim()
+
+    if (!cleanTitle) {
+      await markAsDone(video._id, "标题无效")
+      return
+    }
+
     // C. 搜索 TMDB
     const searchRes = await tmdbApi.get("/search/multi", {
       params: { query: cleanTitle },
     })
 
     const results = searchRes.data.results || []
-
-    // 没搜到 -> 兜底
     if (results.length === 0) {
-      await keepOldOrIgnore(video, `TMDB无结果: ${cleanTitle}`)
+      await markAsDone(video._id, "TMDB无结果")
       return
     }
 
     // D. 匹配最佳结果
     let bestMatch = null
     for (const item of results) {
-      // 类型校验
       let isLocalMovie = video.category === "movie"
       let isLocalTv = ["tv", "anime", "variety"].includes(video.category)
-
       if (isLocalMovie && item.media_type !== "movie") continue
       if (isLocalTv && item.media_type !== "tv") continue
 
-      // 年份校验
       const releaseDate = item.release_date || item.first_air_date
       if (!isYearSafe(video.year, releaseDate)) continue
 
-      // 标题完全一致直接选中
       const tmdbTitle = item.title || item.name
       if (tmdbTitle === cleanTitle) {
         bestMatch = item
         break
       }
-      // 否则作为备选
       if (!bestMatch) bestMatch = item
     }
 
-    // 匹配失败 -> 兜底
     if (!bestMatch) {
-      await keepOldOrIgnore(video, `校验未通过: ${cleanTitle}`)
+      await markAsDone(video._id, "匹配校验失败")
       return
     }
 
@@ -160,16 +129,17 @@ async function enrichSingleVideo(video) {
     const updateData = buildUpdateData(video, bestMatch, detailRes.data)
     await applyUpdateWithMerge(video, updateData)
   } catch (error) {
-    console.error(`❌ 出错 [${rawTitle}]: ${error.message}`)
+    // 🔥🔥🔥 关键修复：就算报错了，也标记为“已处理”，防止死循环！
+    // console.error(`❌ 处理出错 [${rawTitle}]: ${error.message} -> 强制跳过`);
+    await markAsDone(video._id)
   }
 }
 
 // ==========================================
-// 5. 数据组装与合并
+// 4. 辅助函数
 // ==========================================
 
 function buildUpdateData(localVideo, match, details) {
-  // 提取演职员
   const directors =
     details.credits?.crew
       ?.filter((c) => c.job === "Director")
@@ -181,13 +151,10 @@ function buildUpdateData(localVideo, match, details) {
       ?.slice(0, 10)
       .map((c) => c.name)
       .join(",") || ""
-
-  // 提取国家
   let country = ""
   if (details.production_countries?.length > 0)
     country = details.production_countries[0].name
 
-  // 智能标签
   let newTags = localVideo.tags ? [...localVideo.tags] : []
   if (details.genres) newTags.push(...details.genres.map((g) => g.name))
   const companies = [
@@ -227,20 +194,14 @@ function buildUpdateData(localVideo, match, details) {
 
 async function applyUpdateWithMerge(currentVideo, updateData) {
   try {
-    // 尝试更新
     await Video.updateOne({ _id: currentVideo._id }, { $set: updateData })
   } catch (error) {
-    // 处理唯一索引冲突 (E11000) -> 合并逻辑
     if (error.code === 11000) {
       const existingVideo = await Video.findOne({ tmdb_id: updateData.tmdb_id })
-
-      // 确保不是自己撞自己
       if (
         existingVideo &&
         existingVideo._id.toString() !== currentVideo._id.toString()
       ) {
-        // console.log(`🔀 [合并] ${updateData.title} (ID: ${updateData.tmdb_id})`);
-
         let isModified = false
         for (const s of currentVideo.sources) {
           const exists = existingVideo.sources.some(
@@ -251,77 +212,75 @@ async function applyUpdateWithMerge(currentVideo, updateData) {
             isModified = true
           }
         }
-
         if (isModified) {
           existingVideo.updatedAt = new Date()
           await existingVideo.save()
         }
-
-        // 删除当前冗余数据
         await Video.deleteOne({ _id: currentVideo._id })
       }
+    } else {
+      // 其他保存错误，也尝试强制标记为已清洗，防止卡死
+      await markAsDone(currentVideo._id)
     }
   }
 }
 
+// ==========================================
+// 5. 主程序 (分批处理模式)
+// ==========================================
 async function runEnrichTask(isFullScan = false) {
   console.log(`🚀 [TMDB清洗] 任务启动...`)
 
   const query = { is_enriched: false }
-
-  // 1. 先获取总数，用于显示进度
   let totalLeft = await Video.countDocuments(query)
   const totalStart = totalLeft
-  console.log(`📊 初始待处理: ${totalStart} 条`)
+  console.log(`📊 待处理: ${totalStart} 条`)
 
-  if (totalLeft === 0) {
-    console.log("✨ 暂无需要清洗的数据")
-    return
-  }
+  if (totalLeft === 0) return
 
-  // 2. 循环分批处理
-  // 只要还有没洗过的数据，就继续循环
+  // 只要还有没洗过的，就继续循环
   while (totalLeft > 0) {
     try {
-      // 每次只取 200 条
-      // lean() 可以让查询更快，返回普通 JS 对象 (但我们需要 save，所以这里不用 lean，或者手动 hydrate)
-      // 这里直接取文档以便使用 .save()
+      // 每次取 200 条
       const batchDocs = await Video.find(query)
-        .select("_id title year category tags sources tmdb_id overview poster") // 只取需要的字段，减少内存
+        .select("_id title year category tags sources tmdb_id overview poster")
         .limit(200)
 
-      if (batchDocs.length === 0) break // 双重保险
+      if (batchDocs.length === 0) break
 
-      // 并发处理这 200 条
+      // 并发处理
       const promises = batchDocs.map((doc) => {
-        // 使用 p-limit 限制并发数为 5
         return limit(() => enrichSingleVideo(doc))
       })
 
-      // 等待这一批全部做完
       await Promise.all(promises)
 
-      // 更新剩余数量
-      // 注意：不能简单的 totalLeft - 200，因为可能有处理失败的
-      // 我们重新查一次剩余数量，虽然有一点点性能损耗，但进度最准确
-      totalLeft = await Video.countDocuments(query)
+      // 重新计算剩余数量
+      const newTotalLeft = await Video.countDocuments(query)
 
+      // 🔥 死循环检测：如果处理了一轮，数量完全没变，说明出大问题了，强制中断
+      if (newTotalLeft === totalLeft) {
+        console.error(
+          "⛔ [警告] 队列未动，检测到死循环风险，强制停止本次任务。"
+        )
+        break
+      }
+
+      totalLeft = newTotalLeft
       const processed = totalStart - totalLeft
       console.log(`⏳ 进度: ${processed} / ${totalStart} (剩余: ${totalLeft})`)
 
-      // 休息一下，防止 TMDB 也就是太频繁封 IP
+      // 休息一下，防止被封
       await new Promise((r) => setTimeout(r, 1000))
     } catch (err) {
-      console.error(`💥 批次处理出错: ${err.message}`)
-      // 出错后休息久一点再试
+      console.error(`💥 批次出错: ${err.message}`)
       await new Promise((r) => setTimeout(r, 5000))
     }
   }
 
-  console.log("✅ 所有清洗任务完成")
+  console.log("✅ 清洗任务结束")
 }
 
-// 本地调试入口
 if (require.main === module) {
   const MONGO_URI = process.env.MONGO_URI
   const mongoose = require("mongoose")
