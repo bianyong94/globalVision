@@ -7,17 +7,34 @@ const Video = require("../models/Video")
 // 1. 配置
 // ==========================================
 const TMDB_TOKEN = process.env.TMDB_TOKEN
-// 增加超时设置到 8秒，防止请求挂起太久
+if (!TMDB_TOKEN) {
+  console.error("❌ 环境变量 TMDB_TOKEN 未配置")
+  process.exit(1)
+}
+
 const tmdbApi = axios.create({
   baseURL: "https://api.themoviedb.org/3",
   headers: { Authorization: `Bearer ${TMDB_TOKEN}` },
   params: { language: "zh-CN" },
-  timeout: 8000,
+  timeout: 10000,
 })
 
-// 降低并发到 3，求稳不求快，防止 TMDB 报错
-const limit = pLimit(3)
+// 并发数
+const limit = pLimit(20)
 
+// 流媒体平台 ID 映射 (TMDB 标准 ID)
+const PROVIDER_IDS = {
+  8: "Netflix",
+  337: "Disney+",
+  350: "Apple TV+",
+  119: "Amazon Prime", // 很多 HBO 剧在 Amazon
+  283: "Crunchyroll", // 动漫
+  // HBO Max (ID 变化较多，通常通过 Network 识别更准)
+}
+
+// ==========================================
+// 2. 校验与兜底逻辑
+// ==========================================
 function isYearSafe(localYear, tmdbDateStr) {
   if (!localYear || localYear === 0) return true
   if (!tmdbDateStr) return false
@@ -25,32 +42,27 @@ function isYearSafe(localYear, tmdbDateStr) {
   return Math.abs(localYear - tmdbYear) <= 1
 }
 
-// ==========================================
-// 2. 核心：兜底与忽略
-// ==========================================
-
-// 标记为已完成 (无论成功失败，都调用这个)
-async function markAsDone(id, reason = "") {
+async function markAsDone(id) {
   try {
-    // 这里的逻辑是：只要跑过一次，就标记 is_enriched=true
-    // 如果之前有 tmdb_id 就留着，没有就没有，绝不删除旧 ID
-    if (reason) {
-      // console.log(`⚠️ [跳过] ${reason}`);
-    }
     await Video.updateOne({ _id: id }, { $set: { is_enriched: true } })
-  } catch (e) {
-    console.error(`❌ 状态更新失败: ${e.message}`)
-  }
+  } catch (e) {}
 }
 
 async function markAsIgnored(id) {
   try {
-    // 只有确定是垃圾数据时，才删除 ID
     await Video.updateOne(
       { _id: id },
-      { $set: { is_enriched: true }, $unset: { tmdb_id: "" } }
+      { $set: { is_enriched: true }, $unset: { tmdb_id: "" } },
     )
   } catch (e) {}
+}
+
+async function keepOldOrIgnore(video, reason = "") {
+  if (video.tmdb_id && video.tmdb_id !== -1) {
+    await markAsDone(video._id)
+  } else {
+    await markAsIgnored(video._id)
+  }
 }
 
 // ==========================================
@@ -59,15 +71,13 @@ async function markAsIgnored(id) {
 async function enrichSingleVideo(video) {
   const rawTitle = video.title || ""
 
-  // 🔥🔥🔥 全局 Try-Catch：确保任何错误都不会导致死循环
   try {
-    // A. 垃圾数据熔断
-    if (/短剧|爽文|爽剧|反转|赘婿|战神|逆袭|重生|写真|福利/.test(rawTitle)) {
+    // 垃圾熔断
+    if (/短剧|爽文|写真|福利/.test(rawTitle)) {
       await markAsIgnored(video._id)
       return
     }
 
-    // B. 标题预处理
     const cleanTitle = rawTitle
       .replace(/第[0-9一二三四五六七八九十]+[季部]/g, "")
       .replace(/S[0-9]+/i, "")
@@ -76,69 +86,92 @@ async function enrichSingleVideo(video) {
       .trim()
 
     if (!cleanTitle) {
-      await markAsDone(video._id, "标题无效")
+      await keepOldOrIgnore(video)
       return
     }
 
-    // C. 搜索 TMDB
+    // 搜索
     const searchRes = await tmdbApi.get("/search/multi", {
       params: { query: cleanTitle },
     })
 
     const results = searchRes.data.results || []
     if (results.length === 0) {
-      await markAsDone(video._id, "TMDB无结果")
+      await keepOldOrIgnore(video)
       return
     }
 
-    // D. 匹配最佳结果
+    // 匹配
     let bestMatch = null
+    const localYear = video.year
+
     for (const item of results) {
       let isLocalMovie = video.category === "movie"
       let isLocalTv = ["tv", "anime", "variety"].includes(video.category)
-      if (isLocalMovie && item.media_type !== "movie") continue
-      if (isLocalTv && item.media_type !== "tv") continue
-
-      const releaseDate = item.release_date || item.first_air_date
-      if (!isYearSafe(video.year, releaseDate)) continue
 
       const tmdbTitle = item.title || item.name
-      if (tmdbTitle === cleanTitle) {
+      const isTitleExact = tmdbTitle === cleanTitle
+
+      if (!isTitleExact) {
+        if (isLocalMovie && item.media_type !== "movie") continue
+        if (isLocalTv && item.media_type !== "tv") continue
+      }
+
+      const releaseDate = item.release_date || item.first_air_date
+      if (!releaseDate) continue
+      const tmdbYear = parseInt(releaseDate.substring(0, 4))
+
+      let isYearMatch = false
+      if (!localYear || localYear === 0) isYearMatch = true
+      else if (item.media_type === "movie") {
+        if (Math.abs(localYear - tmdbYear) <= 2) isYearMatch = true
+      } else if (item.media_type === "tv") {
+        if (localYear >= tmdbYear - 1) isYearMatch = true
+      }
+
+      if (isTitleExact && isYearMatch) {
         bestMatch = item
         break
       }
-      if (!bestMatch) bestMatch = item
+      if (!bestMatch && isYearMatch) {
+        bestMatch = item
+      }
     }
 
     if (!bestMatch) {
-      await markAsDone(video._id, "匹配校验失败")
+      // 兜底：尝试完全匹配标题
+      bestMatch = results.find(
+        (item) => (item.title || item.name) === cleanTitle,
+      )
+    }
+
+    if (!bestMatch) {
+      await keepOldOrIgnore(video)
       return
     }
 
-    // E. 获取详情
+    // 🔥🔥 获取详情 (包含 watch/providers)
     const detailRes = await tmdbApi.get(
       `/${bestMatch.media_type}/${bestMatch.id}`,
       {
         params: {
-          append_to_response: "credits,keywords,networks,production_companies",
+          // 关键：请求 networks (出品方) 和 watch/providers (播放渠道)
+          append_to_response:
+            "credits,keywords,networks,production_companies,watch/providers",
         },
-      }
+      },
     )
 
-    // F. 更新与合并
     const updateData = buildUpdateData(video, bestMatch, detailRes.data)
     await applyUpdateWithMerge(video, updateData)
   } catch (error) {
-    // 🔥🔥🔥 关键修复：就算报错了，也标记为“已处理”，防止死循环！
-    // console.error(`❌ 处理出错 [${rawTitle}]: ${error.message} -> 强制跳过`);
     await markAsDone(video._id)
   }
 }
 
 // ==========================================
-// 4. 辅助函数
+// 4. 数据组装 (智能标签核心)
 // ==========================================
-
 function buildUpdateData(localVideo, match, details) {
   const directors =
     details.credits?.crew
@@ -151,19 +184,51 @@ function buildUpdateData(localVideo, match, details) {
       ?.slice(0, 10)
       .map((c) => c.name)
       .join(",") || ""
-  let country = ""
-  if (details.production_countries?.length > 0)
-    country = details.production_countries[0].name
+  let country = details.production_countries?.[0]?.name || ""
 
   let newTags = localVideo.tags ? [...localVideo.tags] : []
   if (details.genres) newTags.push(...details.genres.map((g) => g.name))
+
+  // -------------------------------------------------------------
+  // 🔥🔥🔥 智能流媒体识别逻辑 (自动打标) 🔥🔥🔥
+  // -------------------------------------------------------------
+
+  // 1. 检查出品方 (Networks / Companies) -> 识别“原创剧”
+  // 比如 Stranger Things 的 network 是 Netflix
   const companies = [
     ...(details.networks || []),
     ...(details.production_companies || []),
   ]
   const cNames = companies.map((c) => c.name.toLowerCase())
+
   if (cNames.some((n) => n.includes("netflix"))) newTags.push("Netflix")
   if (cNames.some((n) => n.includes("hbo"))) newTags.push("HBO")
+  if (cNames.some((n) => n.includes("disney"))) newTags.push("Disney+")
+  if (cNames.some((n) => n.includes("apple"))) newTags.push("Apple TV+")
+
+  // 2. 检查播放渠道 (Watch Providers) -> 识别“独家播放/分销”
+  // TMDB 会返回全球各地的播放源信息
+  const providersObj = details["watch/providers"]?.results || {}
+
+  // 我们主要检查 'US' (发源地) 和 'TW' (亚洲区) 的 flatrate (会员订阅)
+  const targetRegions = ["US", "TW", "KR", "JP"]
+  const providerSet = new Set()
+
+  targetRegions.forEach((region) => {
+    const regionData = providersObj[region]
+    if (regionData && regionData.flatrate) {
+      regionData.flatrate.forEach((p) => {
+        if (PROVIDER_IDS[p.provider_id]) {
+          providerSet.add(PROVIDER_IDS[p.provider_id])
+        }
+      })
+    }
+  })
+
+  // 将识别到的 Provider 加入标签
+  providerSet.forEach((p) => newTags.push(p))
+
+  // -------------------------------------------------------------
 
   return {
     tmdb_id: match.id,
@@ -180,14 +245,14 @@ function buildUpdateData(localVideo, match, details) {
     vote_count: match.vote_count,
     year:
       parseInt(
-        (match.release_date || match.first_air_date || "").substring(0, 4)
+        (match.release_date || match.first_air_date || "").substring(0, 4),
       ) || localVideo.year,
     category: match.media_type === "movie" ? "movie" : "tv",
     director: directors,
     actors: cast,
     country: country,
     language: details.original_language,
-    tags: [...new Set(newTags)],
+    tags: [...new Set(newTags)], // 去重
     is_enriched: true,
   }
 }
@@ -205,7 +270,7 @@ async function applyUpdateWithMerge(currentVideo, updateData) {
         let isModified = false
         for (const s of currentVideo.sources) {
           const exists = existingVideo.sources.some(
-            (es) => es.source_key === s.source_key && es.vod_id === s.vod_id
+            (es) => es.source_key === s.source_key && es.vod_id === s.vod_id,
           )
           if (!exists) {
             existingVideo.sources.push(s)
@@ -219,17 +284,14 @@ async function applyUpdateWithMerge(currentVideo, updateData) {
         await Video.deleteOne({ _id: currentVideo._id })
       }
     } else {
-      // 其他保存错误，也尝试强制标记为已清洗，防止卡死
       await markAsDone(currentVideo._id)
     }
   }
 }
 
-// ==========================================
-// 5. 主程序 (分批处理模式)
-// ==========================================
+// 主程序
 async function runEnrichTask(isFullScan = false) {
-  console.log(`🚀 [TMDB清洗] 任务启动...`)
+  console.log(`🚀 [TMDB智能清洗] 启动 (并发20)...`)
 
   const query = { is_enriched: false }
   let totalLeft = await Video.countDocuments(query)
@@ -238,57 +300,41 @@ async function runEnrichTask(isFullScan = false) {
 
   if (totalLeft === 0) return
 
-  // 只要还有没洗过的，就继续循环
+  const BATCH_SIZE = 500
+
   while (totalLeft > 0) {
     try {
-      // 每次取 200 条
       const batchDocs = await Video.find(query)
         .select("_id title year category tags sources tmdb_id overview poster")
-        .limit(200)
+        .limit(BATCH_SIZE)
+        .lean()
 
       if (batchDocs.length === 0) break
 
-      // 并发处理
-      const promises = batchDocs.map((doc) => {
-        return limit(() => enrichSingleVideo(doc))
-      })
-
+      const promises = batchDocs.map((doc) =>
+        limit(() => enrichSingleVideo(doc)),
+      )
       await Promise.all(promises)
 
-      // 重新计算剩余数量
       const newTotalLeft = await Video.countDocuments(query)
-
-      // 🔥 死循环检测：如果处理了一轮，数量完全没变，说明出大问题了，强制中断
       if (newTotalLeft === totalLeft) {
-        console.error(
-          "⛔ [警告] 队列未动，检测到死循环风险，强制停止本次任务。"
-        )
+        console.log("⚠️ 进度停止，防死循环退出")
         break
       }
-
       totalLeft = newTotalLeft
-      const processed = totalStart - totalLeft
-      console.log(`⏳ 进度: ${processed} / ${totalStart} (剩余: ${totalLeft})`)
-
-      // 休息一下，防止被封
-      await new Promise((r) => setTimeout(r, 1000))
+      console.log(`⚡ 剩余: ${totalLeft}`)
     } catch (err) {
       console.error(`💥 批次出错: ${err.message}`)
-      await new Promise((r) => setTimeout(r, 5000))
+      await new Promise((r) => setTimeout(r, 2000))
     }
   }
 
-  console.log("✅ 清洗任务结束")
+  console.log("✅ 结束")
 }
 
 if (require.main === module) {
   const MONGO_URI = process.env.MONGO_URI
   const mongoose = require("mongoose")
-  if (!MONGO_URI) {
-    console.error("无 MONGO_URI")
-    process.exit(1)
-  }
-
   mongoose.connect(MONGO_URI).then(async () => {
     await runEnrichTask(true)
     process.exit(0)
