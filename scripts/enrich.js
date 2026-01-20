@@ -264,48 +264,61 @@ async function applyUpdateWithMerge(currentVideo, updateData) {
   }
 }
 
-// ==========================================
-// 6. 主入口
-// ==========================================
 async function runEnrichTask(isFullScan = false) {
   console.log(`🚀 [TMDB清洗] 任务启动...`)
 
-  // 查询条件：所有 is_enriched: false 的数据
-  // 注意：这里去掉了 tmdb_id: { $ne: -1 }，因为我们现在是用 $unset 删除 id，所以不需要过滤 -1
   const query = { is_enriched: false }
 
-  const total = await Video.countDocuments(query)
-  console.log(`📊 待清洗数据: ${total} 条`)
+  // 1. 先获取总数，用于显示进度
+  let totalLeft = await Video.countDocuments(query)
+  const totalStart = totalLeft
+  console.log(`📊 初始待处理: ${totalStart} 条`)
 
-  if (total === 0) {
+  if (totalLeft === 0) {
     console.log("✨ 暂无需要清洗的数据")
     return
   }
 
-  // 使用 Cursor 遍历，内存占用低
-  const cursor = Video.find(query).cursor()
-  let promises = []
-  let processed = 0
+  // 2. 循环分批处理
+  // 只要还有没洗过的数据，就继续循环
+  while (totalLeft > 0) {
+    try {
+      // 每次只取 200 条
+      // lean() 可以让查询更快，返回普通 JS 对象 (但我们需要 save，所以这里不用 lean，或者手动 hydrate)
+      // 这里直接取文档以便使用 .save()
+      const batchDocs = await Video.find(query)
+        .select("_id title year category tags sources tmdb_id overview poster") // 只取需要的字段，减少内存
+        .limit(200)
 
-  for (let doc = await cursor.next(); doc != null; doc = await cursor.next()) {
-    const p = limit(() => enrichSingleVideo(doc))
-    promises.push(p)
-    processed++
+      if (batchDocs.length === 0) break // 双重保险
 
-    // 进度条
-    if (processed % 50 === 0) {
-      // 在 Zeabur 日志里换行显示，避免单行太长
-      console.log(`⏳ 进度: ${processed}/${total}`)
-    }
+      // 并发处理这 200 条
+      const promises = batchDocs.map((doc) => {
+        // 使用 p-limit 限制并发数为 5
+        return limit(() => enrichSingleVideo(doc))
+      })
 
-    if (promises.length >= 20) {
+      // 等待这一批全部做完
       await Promise.all(promises)
-      promises = []
+
+      // 更新剩余数量
+      // 注意：不能简单的 totalLeft - 200，因为可能有处理失败的
+      // 我们重新查一次剩余数量，虽然有一点点性能损耗，但进度最准确
+      totalLeft = await Video.countDocuments(query)
+
+      const processed = totalStart - totalLeft
+      console.log(`⏳ 进度: ${processed} / ${totalStart} (剩余: ${totalLeft})`)
+
+      // 休息一下，防止 TMDB 也就是太频繁封 IP
+      await new Promise((r) => setTimeout(r, 1000))
+    } catch (err) {
+      console.error(`💥 批次处理出错: ${err.message}`)
+      // 出错后休息久一点再试
+      await new Promise((r) => setTimeout(r, 5000))
     }
   }
 
-  await Promise.all(promises)
-  console.log("✅ 本轮清洗任务完成")
+  console.log("✅ 所有清洗任务完成")
 }
 
 // 本地调试入口
