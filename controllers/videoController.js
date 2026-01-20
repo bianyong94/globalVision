@@ -86,7 +86,7 @@ exports.getVideos = async (req, res) => {
     if (tag) {
       matchStage.tags = tag
       // 如果是找“高分”或“豆瓣榜单”，必须过滤掉 0 分的垃圾数据
-      if (tag === "high_score" || tag === "douban_top") {
+      if (tag === "high_score") {
         matchStage.rating = { $gt: 0 }
       }
     }
@@ -96,6 +96,9 @@ exports.getVideos = async (req, res) => {
     // ==========================================
 
     if (sort === "rating" || tag === "high_score" || tag === "高分电影") {
+      // 1. 评分必须大于 0 (排除未评分的)
+      matchStage.rating = { $gt: 0 }
+
       // 1. 强制只看 TMDB 清洗过的数据 (关键！排除采集站的假 10 分)
       matchStage.tmdb_id = { $exists: true }
 
@@ -137,6 +140,10 @@ exports.getVideos = async (req, res) => {
     // 📶 排序参数处理 (sort 参数)
     if (sort === "rating") {
       // 🔥 如果用户手动点击了 "按评分"，也必须过滤垃圾数据
+      // 2. 🔥🔥🔥 新增：评分人数必须超过一定数量 (例如 20人 或 50人)
+      // 这样能过滤掉只有几个人评分的冷门/野鸡片，把真正的高分大片显露出来
+      // 注意：确保你的数据库里有 vote_count 字段 (最新的 enrich.js 已经包含此字段)
+      matchStage.vote_count = { $gte: 20 }
       matchStage.tmdb_id = { $exists: true } // 必须有 TMDB ID
       matchStage.rating = { $gt: 0 } // 分数必须大于 0
       sortStage = { rating: -1, year: -1 }
