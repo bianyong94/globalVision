@@ -340,69 +340,65 @@ exports.searchSources = async (req, res) => {
 
   if (!title) return fail(res, "缺少标题参数", 400)
 
-  // 1. 缓存检查 (同一个片名搜索结果缓存 10 分钟)
-  // 这种实时聚合查询比较消耗服务器带宽，建议加上缓存
+  // 1. 缓存检查 (防止短时间重复搜同一个词炸接口)
   const cacheKey = `sources_search_${encodeURIComponent(title)}`
   const cachedData = await getCache(cacheKey)
   if (cachedData) return success(res, cachedData)
 
   try {
-    // 2. 获取所有配置的源
-    // 我们不使用 PRIORITY_LIST，而是使用 sources 对象的所有 Key，以获取最全的结果
+    // 2. 获取所有配置的源 keys
     const allSourceKeys = Object.keys(sources)
 
     // 3. 并发请求所有源
-    // 使用 Promise.allSettled 防止某一个源挂了导致整个接口失败
+    // 使用 Promise.allSettled 也可以，这里用 map + catch 保证一个挂了不影响其他
     const searchPromises = allSourceKeys.map(async (key) => {
-      const source = sources[key]
+      const sourceConfig = sources[key]
       try {
-        // 大多数资源站的搜索接口参数是 wd={title}
-        // ac=detail 可以直接获取详情，如果不支持可以改 ac=list
-        const response = await axios.get(source.url, {
+        // 请求资源站: ac=detail 才能拿到播放地址
+        const response = await axios.get(sourceConfig.url, {
           params: { ac: "detail", wd: title },
-          timeout: 10000, // 设置 4s 超时，防止接口太慢
-          ...getAxiosConfig(), // 复用你的代理/Header配置
+          timeout: 6000, // 6秒超时，太慢的源就不要了
+          ...getAxiosConfig(),
         })
 
         const list = response.data?.list || []
 
-        // 4. 精确匹配逻辑
-        // 资源站搜索是模糊的，搜"庆余年"可能会出来"庆余年花絮"
-        // 我们需要找到跟当前标题高度匹配的那个
-        const match = list.find(
-          (item) =>
-            // 完全相等，或者包含关系(容错)
-            item.vod_name === title ||
-            (item.vod_name.includes(title) &&
-              item.vod_name.length < title.length + 2),
-        )
+        // 4. 过滤与匹配逻辑
+        // 资源站搜索是模糊的，我们需要过滤掉不相关的
+        const validItems = list.filter((item) => {
+          // 简单包含关系，忽略大小写
+          return item.vod_name.toLowerCase().includes(title.toLowerCase())
+        })
 
-        if (match) {
-          return {
-            key: key, // 源标识 (feifan)
-            name: source.name, // 源名称 (非凡资源)
-            // 构造前端跳转需要的 ID 格式
-            id: `${key}_${match.vod_id}`,
-            // 顺便把更新状态带回去，方便用户对比 (如: "非凡: 更新至30集" vs "量子: 全36集")
-            remarks: match.vod_remarks,
-            // 如果需要，可以把播放地址也带上，预加载
-            // type: match.type_name
-          }
-        }
-        return null
+        // 5. 格式化返回数据
+        return validItems.map((item) => ({
+          // 构造临时 ID (格式: feifan_12345)
+          id: `${key}_${item.vod_id}`,
+          source_key: key,
+          source_name: sourceConfig.name, // 显示 "非凡资源"
+
+          // 🔥 关键：返回具体标题，方便用户区分是 "第一季" 还是 "第二季"
+          title: item.vod_name,
+
+          // 🔥 关键：返回播放地址，前端点击即播，无需再查
+          vod_play_url: item.vod_play_url,
+          remarks: item.vod_remarks,
+
+          // 标记类型
+          type: "external",
+        }))
       } catch (err) {
-        // console.warn(`源 ${source.name} 搜索超时或失败`);
-        return null // 失败忽略
+        // console.warn(`源 ${sourceConfig.name} 搜索超时或失败`);
+        return [] // 失败返回空数组，不影响整体
       }
     })
 
     const results = await Promise.all(searchPromises)
 
-    // 5. 过滤掉无效结果
-    const availableSources = results.filter((item) => item !== null)
+    // 5. 拍平数组 (因为 map 返回的是 array of arrays)
+    const availableSources = results.flat()
 
     if (availableSources.length === 0) {
-      // 如果全网都没搜到，返回空数组
       return success(res, [])
     }
 
@@ -420,7 +416,7 @@ exports.matchResource = async (req, res) => {
   // 1. 接收参数
   const { tmdb_id, category, title, year } = req.query
 
-  // 辅助函数：统一返回成功/失败 (假设您已在 controller 顶部定义)
+  // 辅助函数
   const success = (res, data) =>
     res.json({ code: 200, message: "success", data })
   const fail = (res, msg = "Error", code = 500) =>
@@ -438,7 +434,6 @@ exports.matchResource = async (req, res) => {
     // ==========================================
     if (tmdb_id) {
       const tmdbIdNum = parseInt(tmdb_id)
-      // 同时尝试数字类型和原始字符串类型查找
       if (!isNaN(tmdbIdNum)) {
         video = await Video.findOne({ tmdb_id: tmdbIdNum })
       }
@@ -461,7 +456,6 @@ exports.matchResource = async (req, res) => {
       }
 
       // 🔒 2. 年份模糊校验 (误差容忍 ±1年)
-      // 防止匹配到不同年代的同名翻拍剧
       if (year) {
         const y = parseInt(year)
         if (!isNaN(y)) {
@@ -469,15 +463,15 @@ exports.matchResource = async (req, res) => {
         }
       }
 
-      // 🔒 3. 原始分类黑名单过滤 (排除短剧特征)
+      // 🔒 3. 原始分类黑名单过滤
       query.original_type = { $not: /短剧|爽文|爽剧|反转|赘婿|战神|重生/ }
 
-      // 执行查询，按更新时间排序取最新的一个
+      // 执行查询，取最新的一个
       video = await Video.findOne(query).sort({ updatedAt: -1 })
 
-      // 🔥 4. 二次逻辑校验 (安全性防御)
+      // 🔥 4. 二次逻辑校验
       if (video) {
-        // A. 如果前端要找的是电影 (movie)，但数据库里这个资源集数 > 5，判定为伪装成电影的短剧
+        // 检查是否为伪装成电影的短剧
         const checkUrl =
           video.sources?.[0]?.vod_play_url || video.vod_play_url || ""
         const episodeCount = checkUrl ? checkUrl.split("#").length : 0
@@ -486,40 +480,38 @@ exports.matchResource = async (req, res) => {
           (category === "movie" || video.category === "movie") &&
           episodeCount > 5
         ) {
-          console.log(
-            `[Match] 拦截疑似短剧数据: ${video.title} (集数: ${episodeCount})`,
-          )
-          video = null // 舍弃错误匹配
+          console.log(`[Match] 拦截疑似短剧: ${video.title}`)
+          video = null
         }
       }
     }
 
     // ==========================================
-    // 🚀 结果处理与数据提取 (适配聚合模型)
+    // 🚀 结果提取
     // ==========================================
     if (video) {
-      // 1. 获取集数 (优先从聚合的 sources 数组获取，兼容旧 flat 模型)
+      // 获取集数 (适配聚合模型 sources 数组)
       let finalEpisodeCount = 0
       let finalPlayFrom = "unknown"
 
       if (video.sources && video.sources.length > 0) {
-        // 取第一个可用源进行计算
+        // 取第一个可用源
         const firstSource = video.sources[0]
         finalPlayFrom = firstSource.source_key
         finalEpisodeCount = firstSource.vod_play_url
           ? firstSource.vod_play_url.split("#").length
           : 0
       } else if (video.vod_play_url) {
-        // 兼容旧格式数据
+        // 兼容旧数据
         finalPlayFrom = video.source || "unknown"
         finalEpisodeCount = video.vod_play_url.split("#").length
       }
 
-      // 2. 只有当确实有播放链接时才返回 true
+      // 只有当确实有播放链接时才返回
       if (finalEpisodeCount > 0) {
         return success(res, {
           found: true,
-          // 🔥 关键：返回 MongoDB _id，确保前端 detail 接口能查到
+          // 🔥 关键：返回 MongoDB _id，供前端跳转详情页
           id: video._id.toString(),
           title: video.title,
           source: finalPlayFrom,
@@ -529,10 +521,10 @@ exports.matchResource = async (req, res) => {
       }
     }
 
-    // 没找到或无有效播放源
+    // 没找到
     return success(res, {
       found: false,
-      message: "本地库暂未收录该资源或链接失效",
+      message: "本地库暂未收录该资源",
     })
   } catch (e) {
     console.error("Match Error:", e)
