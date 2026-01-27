@@ -129,5 +129,5 @@ app.listen(PORT, "0.0.0.0", () => {
 // Cron (定时任务)
 cron.schedule("0 */2 * * *", () => {
   console.log("⏰ 定时任务触发：开始增量采集...")
-  syncTask(3)
+  // if (process.env.NODE_ENV === "production") syncTask(3)
 })

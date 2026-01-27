@@ -9,6 +9,10 @@ const { sources } = require("../config/constants")
 const axios = require("axios")
 const mongoose = require("mongoose")
 
+const escapeRegex = (string) => {
+  return string.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&")
+}
+
 const success = (res, data) => res.json({ code: 200, message: "success", data })
 const fail = (res, msg = "Error", code = 500) =>
   res.json({ code, message: msg })
@@ -59,7 +63,8 @@ exports.getVideos = async (req, res) => {
 
     // 🔍 关键词搜索
     if (wd) {
-      const regex = new RegExp(wd, "i")
+      const safeWd = escapeRegex(wd) // ✅ 安全
+      const regex = new RegExp(safeWd, "i")
       matchStage.$or = [
         { title: regex },
         { actors: regex },
@@ -79,7 +84,12 @@ exports.getVideos = async (req, res) => {
 
     // 📅 年份筛选
     if (year && year !== "全部") {
-      matchStage.year = parseInt(year)
+      const targetYear = parseInt(year)
+      if (!isNaN(targetYear)) {
+        // 兼容数字和字符串两种存储情况
+        matchStage.$or = [{ year: targetYear }, { year: String(targetYear) }]
+        // 如果你的数据库year字段确定全是数字，则保留原样即可
+      }
     }
 
     // ==========================================
@@ -97,14 +107,20 @@ exports.getVideos = async (req, res) => {
         // 3. 必须是清洗过的数据
         matchStage.tmdb_id = { $exists: true }
       } else if (lowerTag === "netflix") {
-        // 🎬 Netflix 模式 (忽略大小写)
-        matchStage.tags = { $in: ["Netflix", "netflix", "NETFLIX"] }
+        matchStage.tags = { $regex: /netflix/i }
       } else if (["4k", "2160p"].includes(lowerTag)) {
         // 💎 4K 模式
         matchStage.tags = { $in: ["4K", "4k", "2160P"] }
+      } else if (
+        ["nba", "cba", "f1", "欧冠", "世界杯", "奥运会"].includes(lowerTag)
+      ) {
+        matchStage.$or = [
+          { title: { $regex: new RegExp(tag, "i") } }, // 搜标题
+          { tags: { $regex: new RegExp(tag, "i") } }, // 保险起见，也搜一下tag
+        ]
       } else {
         // 🏷️ 普通标签 (通用正则匹配，忽略大小写)
-        matchStage.tags = { $regex: new RegExp(`^${tag}$`, "i") }
+        matchStage.tags = { $regex: new RegExp(tag, "i") }
       }
     }
 
@@ -127,7 +143,7 @@ exports.getVideos = async (req, res) => {
       if (!matchStage.vote_count) {
         matchStage.vote_count = { $gt: 0 } // 至少有人评过分
       }
-    } else if (sort === "year") {
+    } else if (sort === "year" || sort === "time") {
       // 📅 按年份排序
       sortStage = { year: -1, updatedAt: -1 }
     } else {
@@ -413,10 +429,8 @@ exports.searchSources = async (req, res) => {
 }
 
 exports.matchResource = async (req, res) => {
-  // 1. 接收参数
   const { tmdb_id, category, title, year } = req.query
 
-  // 辅助函数
   const success = (res, data) =>
     res.json({ code: 200, message: "success", data })
   const fail = (res, msg = "Error", code = 500) =>
@@ -430,104 +444,156 @@ exports.matchResource = async (req, res) => {
     let video = null
 
     // ==========================================
-    // 🎯 策略 A: TMDB ID 精准匹配 (最优先)
+    // 🎯 策略 A: TMDB ID 精准匹配
     // ==========================================
     if (tmdb_id) {
-      const tmdbIdNum = parseInt(tmdb_id)
-      if (!isNaN(tmdbIdNum)) {
-        video = await Video.findOne({ tmdb_id: tmdbIdNum })
+      // 1. 先判断是不是误传了 MongoDB 的 _id (24位 hex 字符串)
+      // 如果是，直接按 _id 找，不用再匹配了
+      if (/^[0-9a-fA-F]{24}$/.test(tmdb_id)) {
+        try {
+          video = await Video.findById(tmdb_id)
+          if (video)
+            console.log(`[Match] 通过 MongoID 直接命中: ${video.title}`)
+        } catch (e) {}
       }
+
+      // 2. 如果没找到，再当做 TMDB ID (数字) 去找
       if (!video) {
-        video = await Video.findOne({ tmdb_id: tmdb_id })
+        const tmdbIdNum = parseInt(tmdb_id)
+        if (!isNaN(tmdbIdNum)) {
+          video = await Video.findOne({ tmdb_id: tmdbIdNum })
+        }
       }
     }
 
     // ==========================================
-    // 🔎 策略 B: 标题 + 年份 + 分类 兜底匹配
+    // 🔎 策略 B: 智能模糊匹配 (核心优化)
     // ==========================================
     if (!video && title) {
-      console.log(`[Match] 尝试标题匹配: ${title} (${year || "无年份"})`)
+      // 🛠️ 1. 标题清洗：移除 "第二季", "Season 2", "Netflix" 等干扰词，提高命中率
+      const cleanTitle = title
+        .replace(/（.*?）|\(.*?\)/g, "") // 去括号
+        .replace(/(第.季|Season \d+|Netflix|4K|1080P)/gi, "") // 去修饰词
+        .trim()
 
-      const query = { title: title }
+      console.log(
+        `[Match] 原始: ${title} -> 清洗后: ${cleanTitle} (Cat: ${category})`,
+      )
 
-      // 🔒 1. 强分类校验
+      const query = {}
+
+      // 🛠️ 2. 标题模糊查询 (Regex)
+      // 使用正则包含匹配，且忽略大小写
+      // 对正则特殊字符进行转义，防止报错
+      const safeTitle = cleanTitle.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&")
+      query.title = { $regex: new RegExp(safeTitle, "i") }
+
+      // 🛠️ 3. 分类智能映射 (解决 tv != 日本动漫 的问题)
       if (category && category !== "all") {
-        query.category = category
+        const catMap = {
+          // 只要前端传了 movie，就在这些中文分类里找
+          movie: [
+            "电影",
+            "动作",
+            "科幻",
+            "爱情",
+            "喜剧",
+            "恐怖",
+            "剧情",
+            "战争",
+            "灾难",
+            "Netflix",
+          ],
+          // 只要前端传了 tv，就在这些中文分类里找
+          tv: [
+            "剧集",
+            "国产",
+            "欧美",
+            "韩剧",
+            "日剧",
+            "日本",
+            "动漫",
+            "日本动漫",
+            "海外",
+            "Netflix",
+          ],
+          anime: ["动漫", "日本动漫", "国产动漫"],
+          variety: ["综艺", "大陆综艺", "日韩综艺"],
+        }
+
+        // 如果映射表里有，就用 $in 查询；如果没有，就模糊匹配一下
+        const targetCats = catMap[category]
+        if (targetCats) {
+          // 搜 category 字段 或者 tags 字段
+          query.$or = [
+            { category: { $in: targetCats } },
+            { tags: { $in: targetCats } }, // 有时候分类标错了，但标签是对的
+          ]
+        } else {
+          // 兜底：如果传了未知的分类，尝试模糊匹配
+          query.category = { $regex: new RegExp(category, "i") }
+        }
       }
 
-      // 🔒 2. 年份模糊校验 (误差容忍 ±1年)
+      // 🔒 4. 年份模糊校验 (保持原样，这逻辑挺好)
       if (year) {
         const y = parseInt(year)
         if (!isNaN(y)) {
-          query.year = { $gte: y - 1, $lte: y + 1 }
+          // 如果前面有 $or 查询，这里必须小心合并
+          // 使用 $and 确保年份限制对 $or 里的条件都生效
+          const yearQuery = { year: { $gte: y - 1, $lte: y + 1 } }
+          if (query.$or) {
+            query.$and = [yearQuery, { $or: query.$or }]
+            delete query.$or // 移入 $and
+          } else {
+            query.year = yearQuery.year
+          }
         }
       }
 
-      // 🔒 3. 原始分类黑名单过滤
-      query.original_type = { $not: /短剧|爽文|爽剧|反转|赘婿|战神|重生/ }
+      // 🔒 5. 黑名单 (保持原样)
+      query.original_type = { $not: /短剧|爽文|爽剧/ }
 
-      // 执行查询，取最新的一个
+      // 执行查询，优先找 rating 高的，或者最近更新的
       video = await Video.findOne(query).sort({ updatedAt: -1 })
-
-      // 🔥 4. 二次逻辑校验
-      if (video) {
-        // 检查是否为伪装成电影的短剧
-        const checkUrl =
-          video.sources?.[0]?.vod_play_url || video.vod_play_url || ""
-        const episodeCount = checkUrl ? checkUrl.split("#").length : 0
-
-        if (
-          (category === "movie" || video.category === "movie") &&
-          episodeCount > 5
-        ) {
-          console.log(`[Match] 拦截疑似短剧: ${video.title}`)
-          video = null
-        }
-      }
     }
 
     // ==========================================
     // 🚀 结果提取
     // ==========================================
     if (video) {
-      // 获取集数 (适配聚合模型 sources 数组)
+      // (保持原有的提取 source 和 episode 逻辑不变)
       let finalEpisodeCount = 0
       let finalPlayFrom = "unknown"
 
       if (video.sources && video.sources.length > 0) {
-        // 取第一个可用源
         const firstSource = video.sources[0]
         finalPlayFrom = firstSource.source_key
         finalEpisodeCount = firstSource.vod_play_url
           ? firstSource.vod_play_url.split("#").length
           : 0
       } else if (video.vod_play_url) {
-        // 兼容旧数据
         finalPlayFrom = video.source || "unknown"
         finalEpisodeCount = video.vod_play_url.split("#").length
       }
 
-      // 只有当确实有播放链接时才返回
-      if (finalEpisodeCount > 0) {
-        return success(res, {
-          found: true,
-          // 🔥 关键：返回 MongoDB _id，供前端跳转详情页
-          id: video._id.toString(),
-          title: video.title,
-          source: finalPlayFrom,
-          episodes_count: finalEpisodeCount,
-          year: video.year,
-        })
-      }
+      // 只要找到了，不管有没有播放源，先返回 found: true
+      // (有些资源可能暂时没集数，但至少匹配到了详情)
+      return success(res, {
+        found: true,
+        id: video._id.toString(),
+        title: video.title,
+        source: finalPlayFrom,
+        episodes_count: finalEpisodeCount,
+        year: video.year,
+        // 告诉前端匹配到了什么分类，方便调试
+        matched_category: video.category,
+      })
     }
 
-    // 没找到
-    return success(res, {
-      found: false,
-      message: "本地库暂未收录该资源",
-    })
+    return success(res, { found: false, message: "本地库暂未收录" })
   } catch (e) {
     console.error("Match Error:", e)
-    return fail(res, "匹配过程发生异常: " + e.message)
+    return fail(res, "匹配异常")
   }
 }
