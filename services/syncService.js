@@ -1,28 +1,36 @@
 // services/syncService.js
+
 const axios = require("axios")
 const Video = require("../models/Video")
 const { sources } = require("../config/sources")
-const { getAxiosConfig } = require("./videoService")
+const { getAxiosConfig } = require("../services/videoService")
+const logger = require("../utils/simpleLogger")
 
-// 🎯 定义
 const SYNC_SOURCES = ["feifan", "liangzi", "maotai"]
-const BACKFILL_SOURCES = ["feifan", "liangzi"] // 只补这两个快的
+const BACKFILL_SOURCES = ["feifan", "liangzi"]
 
-// ==========================================
-// 🛠️ 基础：处理单条 (被增量同步调用)
-// ==========================================
+// ----------------------------------------------------------------
+// 🛠️ 基础逻辑：单条数据匹配入库 (严格对应 Video Schema)
+// ----------------------------------------------------------------
 async function processExternalItem(sourceKey, item) {
   try {
     const video = await Video.findOne({ title: item.vod_name })
     if (video) {
       const existingKeys = video.sources.map((s) => s.source_key)
       if (!existingKeys.includes(sourceKey)) {
+        // 🔥 核心修正：严格按照 SourceSchema 构造对象
         video.sources.push({
-          source_key: sourceKey,
-          source_name: sources[sourceKey].name,
-          vod_play_url: item.vod_play_url,
-          remarks: item.vod_remarks,
+          source_key: sourceKey, // 必需
+          vod_id: item.vod_id, // 必需 (之前报错就是缺这个)
+          vod_name: item.vod_name, // 新增：存入资源站片名
+          vod_play_from: item.vod_play_from, // 新增：播放器类型
+          vod_play_url: item.vod_play_url, // 必需
+          remarks: item.vod_remarks, // 备注 (如: 更新至10集)
+          // priority: 0,                // 自动应用 Schema 默认值 0
+          // updatedAt: new Date(),      // 自动应用 Schema 默认值 Date.now
         })
+
+        // 更新主文档时间，让它浮到列表前面
         video.updatedAt = new Date()
         await video.save()
         return "updated"
@@ -30,18 +38,17 @@ async function processExternalItem(sourceKey, item) {
     }
     return "no_change"
   } catch (e) {
-    return "error"
+    throw e
   }
 }
 
-// ==========================================
-// ⚡ 智能补全 (Smart Backfill) - 修正版
-// ==========================================
+// ----------------------------------------------------------------
+// ⚡ 智能补全任务 (Smart Backfill)
+// ----------------------------------------------------------------
 exports.runSmartBackfill = async () => {
-  console.log("🕵️ [Backfill] 正在分析数据库待补全列表...")
+  logger.info("🕵️ [Init] 正在检查数据库健康状态...")
 
-  // 🔥 核心修正：精准查找“残缺”数据
-  // 逻辑：找出 sources 数组中，source_key 不包含 feifan 或者 不包含 liangzi 的视频
+  // 1. 精准查询：找出 sources 数组里缺少 "feifan" 或 "liangzi" 的视频
   const query = {
     $or: [
       { "sources.source_key": { $ne: "feifan" } },
@@ -52,21 +59,20 @@ exports.runSmartBackfill = async () => {
   const pendingCount = await Video.countDocuments(query)
 
   if (pendingCount === 0) {
-    console.log("✅ [Backfill] 所有视频均已包含非凡和量子源，无需补全。")
+    logger.success("数据健康！所有视频均已包含非凡或量子源，无需补全。")
     return
   }
 
-  console.log(
-    `⚡ [Backfill] 发现 ${pendingCount} 个视频缺少快源，开始极速清洗...`,
+  logger.warn(
+    `发现 ${pendingCount} 个视频缺少快源，启动极速清洗模式 (并发: 15)...`,
   )
 
-  // 游标遍历
   const cursor = Video.find(query).cursor()
 
   let totalProcessed = 0
   let totalUpdated = 0
   let batch = []
-  const BATCH_SIZE = 15 // 并发数
+  const BATCH_SIZE = 15
 
   for (
     let video = await cursor.next();
@@ -80,12 +86,14 @@ exports.runSmartBackfill = async () => {
       totalUpdated += results
       totalProcessed += batch.length
 
-      process.stdout.write(
-        `\r🚀 [Backfill] 进度: ${totalProcessed}/${pendingCount} | 本轮修复: ${results}`,
-      )
+      // 每 150 条打印一次日志，防刷屏
+      if (totalProcessed % 150 === 0 || totalProcessed === pendingCount) {
+        logger.info(
+          `[Backfill 进度] 已扫描: ${totalProcessed}/${pendingCount} | 本轮修复: ${results} | 总修复: ${totalUpdated}`,
+        )
+      }
 
       batch = []
-      // 稍微歇一下
       await new Promise((r) => setTimeout(r, 200))
     }
   }
@@ -93,12 +101,12 @@ exports.runSmartBackfill = async () => {
   if (batch.length > 0) {
     const results = await processBatch(batch)
     totalUpdated += results
-    console.log(
-      `\r🚀 [Backfill] 尾部处理: ${batch.length} | 本轮修复: ${results}`,
-    )
+    logger.info(`[Backfill 完成] 尾部扫描: ${batch.length} | 修复: ${results}`)
   }
 
-  console.log(`\n🎉 [Backfill] 清洗完成！总计修复: ${totalUpdated} 条。`)
+  logger.success(
+    `🎉 旧数据清洗完成！总计修复: ${totalUpdated} 条。下次启动将自动跳过此步骤。`,
+  )
 }
 
 // 辅助：批量处理
@@ -107,10 +115,7 @@ async function processBatch(videos) {
     let isModified = false
     const existingKeys = video.sources.map((s) => s.source_key)
 
-    // 遍历我们需要补的源 (feifan, liangzi)
     for (const targetKey of BACKFILL_SOURCES) {
-      // 🛡️ 关键判断：如果这个视频已经有这个key了，就跳过
-      // 比如它有 maotai + feifan，只缺 liangzi，那 feifan 这轮循环就会跳过
       if (existingKeys.includes(targetKey)) continue
 
       try {
@@ -125,16 +130,21 @@ async function processBatch(videos) {
         const match = list.find((item) => item.vod_name === video.title)
 
         if (match) {
+          // 🔥 核心修正：推入完整字段
           video.sources.push({
             source_key: targetKey,
-            source_name: sourceConfig.name,
-            vod_play_url: match.vod_play_url,
+            vod_id: match.vod_id, // 必需
+            vod_name: match.vod_name, // 新增
+            vod_play_from: match.vod_play_from, // 新增
+            vod_play_url: match.vod_play_url, // 必需
             remarks: match.vod_remarks,
           })
           isModified = true
         }
       } catch (e) {
-        /* error */
+        if (e.response?.status !== 404) {
+          // 忽略非致命网络错误
+        }
       }
     }
 
@@ -149,11 +159,12 @@ async function processBatch(videos) {
   return results.reduce((a, b) => a + b, 0)
 }
 
-// ==========================================
-// 🐢 增量同步 (日常)
-// ==========================================
+// ----------------------------------------------------------------
+// 🐢 增量同步任务 (日常)
+// ----------------------------------------------------------------
 exports.syncRecentUpdates = async (hours = 24) => {
-  console.log(`⏰ [Cron] 开始增量同步 (最近 ${hours}h)...`)
+  logger.info(`⏰ [Cron] 开始增量同步 (最近 ${hours}h)...`)
+
   for (const key of SYNC_SOURCES) {
     try {
       const config = sources[key]
@@ -164,15 +175,23 @@ exports.syncRecentUpdates = async (hours = 24) => {
       })
 
       const list = res.data?.list || []
-      console.log(`   📡 [${config.name}] 更新: ${list.length} 条`)
+      logger.info(
+        `📡 [${config.name}] 拉取到 ${list.length} 条更新，开始入库...`,
+      )
 
       let count = 0
       for (const item of list) {
         const res = await processExternalItem(key, item)
         if (res === "updated") count++
       }
+
+      if (count > 0) {
+        logger.success(`✅ [${config.name}] 处理完毕: 新增/更新 ${count} 条`)
+      } else {
+        logger.info(`👌 [${config.name}] 处理完毕: 无需更新`)
+      }
     } catch (e) {
-      console.error(`   ❌ [${key}] 失败: ${e.message}`)
+      logger.error(`[${key}] 同步失败`, e)
     }
   }
 }
