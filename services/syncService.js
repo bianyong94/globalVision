@@ -191,7 +191,7 @@ exports.syncRecentUpdates = async (hours = 24) => {
         logger.info(`👌 [${config.name}] 处理完毕: 无需更新`)
       }
     } catch (e) {
-      logger.error(`[${key}] 同步失败`, e)
+      logger.error(`[${key}] 同步失败了`, e)
     }
   }
 }
