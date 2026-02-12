@@ -4,7 +4,6 @@ const axios = require("axios")
 const Video = require("../models/Video")
 const { sources } = require("../config/sources")
 const { getAxiosConfig } = require("../services/videoService")
-const logger = require("../utils/simpleLogger")
 
 const SYNC_SOURCES = ["feifan", "liangzi", "maotai"]
 const BACKFILL_SOURCES = ["feifan", "liangzi"]
@@ -46,7 +45,7 @@ async function processExternalItem(sourceKey, item) {
 // ⚡ 智能补全任务 (Smart Backfill)
 // ----------------------------------------------------------------
 exports.runSmartBackfill = async () => {
-  logger.info("🕵️ [Init] 正在检查数据库健康状态...")
+  console.info("🕵️ [Init] 正在检查数据库健康状态...")
 
   // 1. 精准查询：找出 sources 数组里缺少 "feifan" 或 "liangzi" 的视频
   const query = {
@@ -59,11 +58,11 @@ exports.runSmartBackfill = async () => {
   const pendingCount = await Video.countDocuments(query)
 
   if (pendingCount === 0) {
-    logger.success("数据健康！所有视频均已包含非凡或量子源，无需补全。")
+    console.success("数据健康！所有视频均已包含非凡或量子源，无需补全。")
     return
   }
 
-  logger.warn(
+  console.warn(
     `发现 ${pendingCount} 个视频缺少快源，启动极速清洗模式 (并发: 15)...`,
   )
 
@@ -88,7 +87,7 @@ exports.runSmartBackfill = async () => {
 
       // 每 150 条打印一次日志，防刷屏
       if (totalProcessed % 150 === 0 || totalProcessed === pendingCount) {
-        logger.info(
+        console.info(
           `[Backfill 进度] 已扫描: ${totalProcessed}/${pendingCount} | 本轮修复: ${results} | 总修复: ${totalUpdated}`,
         )
       }
@@ -101,10 +100,10 @@ exports.runSmartBackfill = async () => {
   if (batch.length > 0) {
     const results = await processBatch(batch)
     totalUpdated += results
-    logger.info(`[Backfill 完成] 尾部扫描: ${batch.length} | 修复: ${results}`)
+    console.info(`[Backfill 完成] 尾部扫描: ${batch.length} | 修复: ${results}`)
   }
 
-  logger.success(
+  console.success(
     `🎉 旧数据清洗完成！总计修复: ${totalUpdated} 条。下次启动将自动跳过此步骤。`,
   )
 }
@@ -163,7 +162,7 @@ async function processBatch(videos) {
 // 🐢 增量同步任务 (日常)
 // ----------------------------------------------------------------
 exports.syncRecentUpdates = async (hours = 24) => {
-  logger.info(`⏰ [Cron] 开始增量同步 (最近 ${hours}h)...`)
+  console.info(`⏰ [Cron] 开始增量同步 (最近 ${hours}h)...`)
 
   for (const key of SYNC_SOURCES) {
     try {
@@ -175,7 +174,7 @@ exports.syncRecentUpdates = async (hours = 24) => {
       })
 
       const list = res.data?.list || []
-      logger.info(
+      console.info(
         `📡 [${config.name}] 拉取到 ${list.length} 条更新，开始入库...`,
       )
 
@@ -186,12 +185,12 @@ exports.syncRecentUpdates = async (hours = 24) => {
       }
 
       if (count > 0) {
-        logger.success(`✅ [${config.name}] 处理完毕: 新增/更新 ${count} 条`)
+        console.success(`✅ [${config.name}] 处理完毕: 新增/更新 ${count} 条`)
       } else {
-        logger.info(`👌 [${config.name}] 处理完毕: 无需更新`)
+        console.info(`👌 [${config.name}] 处理完毕: 无需更新`)
       }
     } catch (e) {
-      logger.error(`[${key}] 同步失败了`, e)
+      console.error(`[${key}] 同步失败了`, e)
     }
   }
 }
