@@ -5,7 +5,8 @@ const {
   saveToDB,
   getAxiosConfig,
 } = require("../services/videoService")
-const { sources } = require("../config/constants")
+// 👇 1. 引入优先级配置
+const { sources, PRIORITY_LIST } = require("../config/constants")
 const axios = require("axios")
 const mongoose = require("mongoose")
 
@@ -19,6 +20,33 @@ const fail = (res, msg = "Error", code = 500) =>
 
 // 辅助函数：统一返回格式
 const formatDetail = (video) => {
+  // 👇 2. 新增排序逻辑
+  let finalSources = video.sources || []
+  if (finalSources.length > 1) {
+    finalSources.sort((a, b) => {
+      // 获取源在优先级列表中的位置 (找不到返回 -1)
+      let indexA = PRIORITY_LIST.indexOf(a.source_key)
+      let indexB = PRIORITY_LIST.indexOf(b.source_key)
+
+      // 如果配置里没写的源，放到最后面 (给 999 权重)
+      if (indexA === -1) indexA = 999
+      if (indexB === -1) indexB = 999
+
+      return indexA - indexB // 升序排列，index 越小越靠前
+    })
+  }
+
+  // 如果 sources 为空（旧数据），构造默认源
+  if (finalSources.length === 0 && video.vod_play_url) {
+    finalSources = [
+      {
+        source_key: video.source || "unknown",
+        source_name: sources[video.source]?.name || "默认源",
+        vod_play_url: video.vod_play_url,
+        remarks: video.remarks,
+      },
+    ]
+  }
   // 如果是聚合模型，sources 是数组
   // 我们需要确保返回给前端的结构是完整的
   return {
@@ -34,19 +62,7 @@ const formatDetail = (video) => {
     director: video.director,
     tags: video.tags || [],
 
-    // 🔥 核心：直接返回聚合后的 sources 数组
-    // 如果没有 sources 数组（旧数据），则尝试构造一个兼容的
-    sources:
-      video.sources && video.sources.length > 0
-        ? video.sources
-        : [
-            {
-              source_key: video.source || "unknown",
-              source_name: sources[video.source]?.name || "默认源",
-              vod_play_url: video.vod_play_url,
-              remarks: video.remarks,
-            },
-          ],
+    sources: finalSources,
   }
 }
 

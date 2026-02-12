@@ -41,11 +41,11 @@ const CATEGORY_RELATIONS = {
 
 module.exports = {
   // 🔥 核心策略配置
-  MASTER_KEY: "maotai", // 只有这个源的数据是绝对权威，其他的只负责补缺
+  MASTER_KEY: "feifan", // 只有这个源的数据是绝对权威，其他的只负责补缺
   CATEGORY_RELATIONS,
 
   // 优先级列表 (搜索排序用)
-  PRIORITY_LIST: ["maotai"],
+  PRIORITY_LIST: ["feifan", "liangzi", "maotai", "hongniu"],
 
   sources: {
     // ===========================

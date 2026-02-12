@@ -9,6 +9,10 @@ const connectDB = require("./config/db")
 const { initRedis } = require("./config/redis")
 const { syncTask } = require("./scripts/sync")
 const { runEnrichTask } = require("./scripts/enrich")
+const {
+  runSmartBackfill,
+  syncRecentUpdates,
+} = require("./services/syncService")
 
 // 1. 🔥🔥🔥 补全丢失的模型引入
 const Video = require("./models/Video")
@@ -122,7 +126,20 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`)
   // 启动后执行检查
   if (process.env.NODE_ENV === "production") {
-    checkAndSync()
+    setTimeout(async () => {
+      // 1. 智能补全：只针对缺源的旧数据
+      // 下次重启时，因为数据已补全，pendingCount 为 0，会直接跳过，符合你的要求
+      await runSmartBackfill()
+
+      // 2. 增量同步：防止部署期间的漏单
+      console.log("📅 [Init] 检查最近更新...")
+      await syncRecentUpdates(24)
+    }, 5000)
+
+    // 3. 定时任务：每4小时增量更新
+    setInterval(() => {
+      syncRecentUpdates(6)
+    }, 14400000)
   }
 })
 
