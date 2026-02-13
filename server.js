@@ -14,6 +14,7 @@ const {
   syncRecentUpdates,
 } = require("./services/syncService")
 
+// const seoMiddleware = require("./middleware/seo")
 // 1. 🔥🔥🔥 补全丢失的模型引入
 const Video = require("./models/Video")
 
@@ -32,6 +33,7 @@ connectDB()
 
 // 3. Middleware
 app.set("trust proxy", 1)
+// app.use(seoMiddleware)
 app.use(compression())
 app.use(
   cors({
