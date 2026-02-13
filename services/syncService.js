@@ -150,9 +150,8 @@ exports.runSmartBackfill = async () => {
   }
 }
 
-// 辅助：批量处理 (增加了 try-catch 防止炸库)
+// 辅助：批量处理 (调试版 - 用于定位 0 修复原因)
 async function processBatch(videos) {
-  // 使用 map 生成 Promise 数组
   const tasks = videos.map(async (video) => {
     try {
       let isModified = false
@@ -161,16 +160,30 @@ async function processBatch(videos) {
       for (const targetKey of BACKFILL_SOURCES) {
         if (existingKeys.includes(targetKey)) continue
 
+        const sourceConfig = sources[targetKey]
+        if (!sourceConfig) continue
+
         try {
-          const sourceConfig = sources[targetKey]
-          // 增加 header 伪装 (可选)
+          // 1. 打印正在请求谁
+          console.log(`🔍 [搜索中] ${video.title} -> ${targetKey}`)
+
           const res = await axios.get(sourceConfig.url, {
             params: { ac: "detail", wd: video.title },
-            timeout: 5000, // 稍微延长超时
+            timeout: 5000,
             ...getAxiosConfig(),
           })
 
           const list = res.data?.list || []
+
+          // 2. 调试：如果 API 返回空，说明资源站没这个片，或者 IP 被封了
+          if (list.length === 0) {
+            // 只有当连续大量出现这个日志时才需要担心
+            console.warn(`⚠️ [无结果] 源: ${targetKey} | 片名: ${video.title}`)
+            continue
+          }
+
+          // 3. 调试：如果有列表，但没匹配上，说明片名不一致
+          // 这里我们稍微放宽一点匹配逻辑，打印出来看看差异
           const match = list.find((item) => item.vod_name === video.title)
 
           if (match) {
@@ -183,10 +196,19 @@ async function processBatch(videos) {
               remarks: match.vod_remarks,
             })
             isModified = true
+            console.log(`✅ [匹配成功] ${video.title} 找到源: ${targetKey}`)
+          } else {
+            // 打印出不匹配的原因，帮助你排查
+            // 比如数据库叫 "不死之身"，接口返回 "不死之身(2025)"
+            console.log(
+              `❌ [匹配失败] 数据库: "${video.title}" | 接口返回示例: "${list[0]?.vod_name}"`,
+            )
           }
         } catch (innerErr) {
-          // 单个源请求失败，不影响其他源，也不影响其他视频
-          // if (innerErr.response?.status !== 404) console.warn('Source fetch failed:', innerErr.message);
+          // 4. 调试：网络报错
+          console.error(
+            `🔥 [请求报错] ${video.title} -> ${targetKey}: ${innerErr.message}`,
+          )
         }
       }
 
@@ -197,7 +219,7 @@ async function processBatch(videos) {
       return 0
     } catch (videoErr) {
       console.error(`[Skip] 视频处理失败 ID: ${video._id}`, videoErr.message)
-      return 0 // 跳过这一条，算作未修复
+      return 0
     }
   })
 
