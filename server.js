@@ -56,6 +56,7 @@ app.use(
       // 4. 本地开发调试
       "http://localhost:5173",
       "http://localhost:5174",
+      "http://localhost:5175",
       "http://localhost:3000",
 
       // 5. 允许所有 IP (如果你想允许局域网调试)

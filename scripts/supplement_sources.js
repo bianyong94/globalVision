@@ -3,33 +3,41 @@ const mongoose = require("mongoose")
 const axios = require("axios")
 const Video = require("../models/Video")
 const { sources } = require("../config/sources")
-const { getAxiosConfig } = require("../services/videoService")
+const { getAxiosConfig } = require("../utils/httpAgent")
 
 // ==========================================
 // 🛡️ 安全配置
 // ==========================================
 const TARGET_SOURCES = ["feifan", "liangzi"] // 要补全的源
-const DRY_RUN = false  // ⚠️ 设为 true 则只打印不保存；设为 false 则真实写入数据库
+const DRY_RUN = false // ⚠️ 设为 true 则只打印不保存；设为 false 则真实写入数据库
 
 async function supplement() {
   await mongoose.connect(process.env.MONGODB_URI)
-  console.log(`✅ DB Connected. Mode: ${DRY_RUN ? '🔍 DRY RUN (只读)' : '⚡ LIVE (写入)'}`)
+  console.log(
+    `✅ DB Connected. Mode: ${DRY_RUN ? "🔍 DRY RUN (只读)" : "⚡ LIVE (写入)"}`,
+  )
 
   // 游标遍历，防止内存溢出
   const cursor = Video.find({}).cursor()
-  
+
   let processed = 0
   let updated = 0
 
-  for (let video = await cursor.next(); video != null; video = await cursor.next()) {
+  for (
+    let video = await cursor.next();
+    video != null;
+    video = await cursor.next()
+  ) {
     processed++
     let isModified = false
-    
+
     // 提取当前已有的源标识，例如 ['maotai']
     // 这一步确保了不会重复添加同一个源
     const existingKeys = video.sources.map((s) => s.source_key)
 
-    process.stdout.write(`\r[${processed}] Processing: ${video.title.substring(0, 20)}... `)
+    process.stdout.write(
+      `\r[${processed}] Processing: ${video.title.substring(0, 20)}... `,
+    )
 
     for (const targetKey of TARGET_SOURCES) {
       // 🛡️ 防重检查 1: 如果已经有了这个源，跳过
@@ -43,14 +51,14 @@ async function supplement() {
         const res = await axios.get(sourceConfig.url, {
           params: { ac: "detail", wd: video.title },
           timeout: 3000, // 超时跳过，不卡死
-          ...getAxiosConfig()
+          ...getAxiosConfig(),
         })
 
         const list = res.data?.list || []
-        
+
         // 🛡️ 防错检查 2: 严格全等匹配
         // 只有 "钢铁侠" === "钢铁侠" 才算，"钢铁侠2" 不算
-        const match = list.find(item => item.vod_name === video.title)
+        const match = list.find((item) => item.vod_name === video.title)
 
         if (match) {
           // 找到了！准备添加
@@ -62,11 +70,13 @@ async function supplement() {
           }
 
           if (DRY_RUN) {
-             console.log(`\n   🔍 [DRY-RUN] Would add ${targetKey} to ${video.title}`)
+            console.log(
+              `\n   🔍 [DRY-RUN] Would add ${targetKey} to ${video.title}`,
+            )
           } else {
-             video.sources.push(newSource)
-             isModified = true
-             console.log(`\n   ➕ Added ${sourceConfig.name}`)
+            video.sources.push(newSource)
+            isModified = true
+            console.log(`\n   ➕ Added ${sourceConfig.name}`)
           }
         }
       } catch (e) {

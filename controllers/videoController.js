@@ -1,12 +1,8 @@
 const Video = require("../models/Video")
 const { getCache, setCache } = require("../utils/cache")
-const {
-  smartFetch,
-  saveToDB,
-  getAxiosConfig,
-} = require("../services/videoService")
+const { getAxiosConfig } = require("../utils/httpAgent")
 // 👇 1. 引入优先级配置
-const { sources, PRIORITY_LIST } = require("../config/constants")
+const { sources, PRIORITY_LIST } = require("../config/sources")
 const axios = require("axios")
 const mongoose = require("mongoose")
 
@@ -373,7 +369,7 @@ exports.searchSources = async (req, res) => {
   if (!title) return fail(res, "缺少标题参数", 400)
 
   // 1. 缓存检查 (防止短时间重复搜同一个词炸接口)
-  const cacheKey = `sources_search_${encodeURIComponent(title)}`
+  const cacheKey = `sources_search_v2_${encodeURIComponent(title)}`
   const cachedData = await getCache(cacheKey)
   if (cachedData) return success(res, cachedData)
 
@@ -427,14 +423,26 @@ exports.searchSources = async (req, res) => {
 
     const results = await Promise.all(searchPromises)
 
-    // 5. 拍平数组 (因为 map 返回的是 array of arrays)
-    const availableSources = results.flat()
+    // 拍平数组
+    let availableSources = results.flat()
 
     if (availableSources.length === 0) {
       return success(res, [])
     }
 
-    // 6. 存入缓存
+    // 👇 2. 【核心新增】给全网搜索的结果也加上优先级排序逻辑
+    availableSources.sort((a, b) => {
+      let indexA = PRIORITY_LIST.indexOf(a.source_key)
+      let indexB = PRIORITY_LIST.indexOf(b.source_key)
+
+      // 如果配置里没写的源，放到最后面 (给 999 权重)
+      if (indexA === -1) indexA = 999
+      if (indexB === -1) indexB = 999
+
+      return indexA - indexB // 升序排列，index 越小越优先
+    })
+
+    // 存入缓存
     await setCache(cacheKey, availableSources, 600)
 
     success(res, availableSources)
@@ -611,5 +619,132 @@ exports.matchResource = async (req, res) => {
   } catch (e) {
     console.error("Match Error:", e)
     return fail(res, "匹配异常")
+  }
+}
+
+exports.ingestVideo = async (req, res) => {
+  const { title } = req.body
+  if (!title) return res.json({ code: 400, message: "缺少影片名称" })
+
+  try {
+    // 1. 先查本地库是否已经有了 (防止用户重复点击)
+    const safeTitle = title.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&")
+    const existVideo = await Video.findOne({
+      title: { $regex: new RegExp(safeTitle, "i") },
+    })
+
+    if (existVideo) {
+      return res.json({
+        code: 200,
+        message: "该影片已在片库中",
+        id: existVideo._id.toString(),
+      })
+    }
+
+    console.log(`\n================================`)
+    console.log(`[Ingest] 🚀 触发一键采录: 关键词【${title}】`)
+
+    // 2. 去全网资源站进行搜索
+    const allSourceKeys = Object.keys(sources)
+    const searchPromises = allSourceKeys.map(async (key) => {
+      const sourceConfig = sources[key]
+      try {
+        const response = await axios.get(sourceConfig.url, {
+          params: { ac: "detail", wd: title },
+          timeout: 8000, // 超时时间稍微拉长一点到 8 秒
+          ...getAxiosConfig(),
+        })
+        const list = response.data?.list || []
+
+        // 🔥 核心修复 1：双向模糊匹配，忽略大小写
+        const validItems = list.filter((item) => {
+          const vName = item.vod_name.toLowerCase()
+          const tName = title.toLowerCase()
+          // 只要资源站的名字包含搜索词，或者搜索词包含资源站名字，都算命中！
+          return vName.includes(tName) || tName.includes(vName)
+        })
+
+        if (validItems.length > 0) {
+          console.log(
+            `[Ingest] ✅ ${sourceConfig.name} 命中 ${validItems.length} 条资源`,
+          )
+        }
+
+        return validItems.map((item) => ({
+          ...item,
+          source_key: key,
+        }))
+      } catch (err) {
+        // 🔥 核心修复 2：把真正的报错原因打印出来
+        console.error(`[Ingest] ❌ ${sourceConfig.name} 请求失败:`, err.message)
+        return []
+      }
+    })
+
+    const results = await Promise.all(searchPromises)
+    const availableSources = results.flat()
+
+    if (availableSources.length === 0) {
+      console.log(`[Ingest] 🚫 采录失败: 全网均未搜到【${title}】`)
+      return res.json({ code: 404, message: "抱歉，全网暂未找到该影视资源" })
+    }
+
+    // 🔥 核心修复 3：按照配置的优先级 (feifan > liangzi) 重新洗牌
+    availableSources.sort((a, b) => {
+      let indexA = PRIORITY_LIST.indexOf(a.source_key)
+      let indexB = PRIORITY_LIST.indexOf(b.source_key)
+      if (indexA === -1) indexA = 999
+      if (indexB === -1) indexB = 999
+      return indexA - indexB
+    })
+
+    // 取最靠谱的第一个源进行本地格式化入库
+    const bestMatch = availableSources[0]
+    console.log(
+      `[Ingest] 🌟 准备入库最优解: 【${bestMatch.vod_name}】(源自: ${bestMatch.source_key})`,
+    )
+
+    // 简单智能分类映射
+    let localCategory = "movie"
+    const typeName = bestMatch.type_name || ""
+    if (typeName.includes("剧")) localCategory = "tv"
+    else if (typeName.includes("综艺") || typeName.includes("晚会"))
+      localCategory = "variety"
+    else if (typeName.includes("动漫") || typeName.includes("动画"))
+      localCategory = "anime"
+
+    const newVideo = new Video({
+      title: bestMatch.vod_name,
+      poster: bestMatch.vod_pic,
+      category: localCategory,
+      year: bestMatch.vod_year,
+      area: bestMatch.vod_area,
+      content: bestMatch.vod_content,
+      actors: bestMatch.vod_actor,
+      director: bestMatch.vod_director,
+      remarks: bestMatch.vod_remarks,
+      sources: [
+        {
+          source_key: bestMatch.source_key,
+          vod_id: bestMatch.vod_id,
+          vod_name: bestMatch.vod_name,
+          vod_play_from: bestMatch.vod_play_from,
+          vod_play_url: bestMatch.vod_play_url,
+          remarks: bestMatch.vod_remarks,
+        },
+      ],
+    })
+
+    await newVideo.save()
+    console.log(`[Ingest] 🎉 入库成功，MongoDB ID: ${newVideo._id}`)
+
+    return res.json({
+      code: 200,
+      message: "🎉 收录成功！",
+      id: newVideo._id.toString(),
+    })
+  } catch (e) {
+    console.error("[Ingest Error] 致命错误:", e)
+    return res.json({ code: 500, message: "服务器收录时发生异常" })
   }
 }

@@ -2,7 +2,7 @@
 const axios = require("axios")
 const Video = require("../models/Video")
 const { sources } = require("../config/sources")
-const { getAxiosConfig } = require("../services/videoService")
+const { getAxiosConfig } = require("../utils/httpAgent")
 
 // 🎯 配置：你需要去这三个网站（这里以 key 代表，需对应 sources.js 的配置）
 const TARGET_SOURCES = ["feifan", "liangzi", "maotai"]

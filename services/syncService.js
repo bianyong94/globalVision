@@ -5,7 +5,7 @@ const fs = require("fs")
 const path = require("path")
 const Video = require("../models/Video")
 const { sources } = require("../config/sources")
-const { getAxiosConfig } = require("../services/videoService")
+const { getAxiosConfig } = require("../utils/httpAgent")
 
 const SYNC_SOURCES = ["feifan", "liangzi", "maotai"]
 const BACKFILL_SOURCES = ["feifan", "liangzi"]
