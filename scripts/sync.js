@@ -38,6 +38,25 @@ function isYearSafe(localYear, tmdbDateStr) {
   return Math.abs(localYear - tmdbYear) <= 1
 }
 
+function normalizeTitle(text = "") {
+  return String(text)
+    .toLowerCase()
+    .replace(/[\s:：·\-—_'"`~!@#$%^&*()（）[\]{}<>《》,，。.?？、\\/|]+/g, "")
+}
+
+function scoreTitle(localTitle = "", tmdbTitle = "") {
+  const a = normalizeTitle(localTitle)
+  const b = normalizeTitle(tmdbTitle)
+  if (!a || !b) return 0
+  if (a === b) return 1
+  if (a.includes(b) || b.includes(a)) return 0.8
+  let common = 0
+  for (const ch of new Set(a.split(""))) {
+    if (b.includes(ch)) common++
+  }
+  return common / Math.max(a.length, b.length)
+}
+
 // ... (状态标记函数保持不变)
 async function markAsDone(id) {
   try {
@@ -90,6 +109,7 @@ async function enrichSingleVideo(video) {
     }
 
     let bestMatch = null
+    let bestScore = -1
     for (const item of results) {
       let isLocalMovie = video.category === "movie"
       let isLocalTv = ["tv", "anime", "variety"].includes(video.category)
@@ -100,11 +120,13 @@ async function enrichSingleVideo(video) {
       if (!isYearSafe(video.year, releaseDate)) continue
 
       const tmdbTitle = item.title || item.name
-      if (tmdbTitle === cleanTitle) {
+      const titleScore = scoreTitle(cleanTitle, tmdbTitle)
+      if (titleScore < 0.45) continue
+      const totalScore = titleScore + 0.2
+      if (totalScore > bestScore) {
         bestMatch = item
-        break
+        bestScore = totalScore
       }
-      if (!bestMatch) bestMatch = item
     }
 
     if (!bestMatch) {
@@ -173,6 +195,7 @@ function buildUpdateData(localVideo, match, details) {
       parseInt(
         (match.release_date || match.first_air_date || "").substring(0, 4)
       ) || localVideo.year,
+    date: match.release_date || match.first_air_date || localVideo.date || "",
     category: match.media_type === "movie" ? "movie" : "tv",
     director: directors,
     actors: cast,

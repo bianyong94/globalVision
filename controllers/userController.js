@@ -1,9 +1,30 @@
 const User = require("../models/User")
 const Video = require("../models/Video")
+const mongoose = require("mongoose")
 
 const success = (res, data) => res.json({ code: 200, message: "success", data })
 const fail = (res, msg = "Error", code = 500) =>
   res.json({ code, message: msg })
+
+const hasSeasonMarker = (text = "") =>
+  /(第\s*[一二两三四五六七八九十百\d]+\s*[季部]|Season\s*\d+|S\d{1,2})/i.test(
+    String(text),
+  )
+
+const extractSeasonLabel = (text = "") => {
+  const match = String(text).match(
+    /第\s*[一二两三四五六七八九十百\d]+\s*[季部]|Season\s*\d+|S\d{1,2}/i,
+  )
+  return match ? String(match[0]).trim() : ""
+}
+
+const buildHistoryKey = (video = {}) => {
+  const baseId = String(video.id || "").trim()
+  const season = String(video.seasonLabel || "").trim()
+  const sourceRef = String(video.sourceRef || "").trim()
+  const suffix = season || sourceRef || "default"
+  return `${baseId}::${suffix}`
+}
 
 exports.register = async (req, res) => {
   const { username, password } = req.body
@@ -42,7 +63,12 @@ exports.getHistory = async (req, res) => {
 
     // 2. 批量去 Video 表查最新的海报、标题
     // (只查需要的字段，速度极快)
-    const freshVideos = await Video.find({ uniq_id: { $in: historyIds } })
+    const objectIds = historyIds.filter((id) =>
+      mongoose.Types.ObjectId.isValid(id),
+    )
+    const freshVideos = await Video.find({
+      $or: [{ uniq_id: { $in: historyIds } }, { _id: { $in: objectIds } }],
+    })
       .select("uniq_id poster pic title")
       .lean()
 
@@ -50,6 +76,9 @@ exports.getHistory = async (req, res) => {
     const videoMap = {}
     freshVideos.forEach((v) => {
       videoMap[v.uniq_id] = v
+      if (v._id) {
+        videoMap[String(v._id)] = v
+      }
     })
 
     // 4. 组装最终数据 (合并逻辑)
@@ -68,7 +97,13 @@ exports.getHistory = async (req, res) => {
           "",
 
         // 顺便也更新一下标题，防止片名变更
-        title: freshInfo ? freshInfo.title : historyItem.title,
+        title:
+          hasSeasonMarker(historyItem.title) || historyItem.seasonLabel
+            ? historyItem.title
+            : freshInfo
+              ? freshInfo.title
+              : historyItem.title,
+        seasonLabel: historyItem.seasonLabel || extractSeasonLabel(historyItem.title),
       }
     })
 
@@ -94,10 +129,13 @@ exports.addHistory = async (req, res) => {
     if (!user) return fail(res, "用户不存在", 404)
 
     const targetId = String(video.id)
+    const targetHistoryKey = buildHistoryKey(video)
 
     // 1. 过滤掉已存在的同一部片子 (避免重复，把旧的删了加新的到最前面)
     let newHistory = (user.history || []).filter(
-      (h) => String(h.id) !== targetId
+      (h) =>
+        String(h.historyKey || `${h.id}::${h.seasonLabel || h.sourceRef || "default"}`) !==
+        targetHistoryKey
     )
 
     // 2. 构造新的记录对象
@@ -106,9 +144,12 @@ exports.addHistory = async (req, res) => {
 
     const historyItem = {
       id: targetId,
+      historyKey: targetHistoryKey,
       title: video.title || "未知片名",
       poster: posterUrl, // 强制统一字段名为 poster
       pic: posterUrl, // 兼容旧字段
+      seasonLabel: video.seasonLabel || "",
+      sourceRef: video.sourceRef || "",
       episodeIndex: parseInt(episodeIndex) || 0,
       progress: parseFloat(progress) || 0,
       viewedAt: new Date().toISOString(),

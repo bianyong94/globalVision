@@ -6,8 +6,236 @@ const { sources, PRIORITY_LIST } = require("../config/sources")
 const axios = require("axios")
 const mongoose = require("mongoose")
 
+const SOURCE_PROBE_TIMEOUT_MS = 2500
+const CHINESE_NUM_MAP = {
+  零: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+  十: 10,
+}
+
 const escapeRegex = (string) => {
   return string.replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&")
+}
+
+const toSafeRating = (value) => {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return parseFloat(n.toFixed(1))
+}
+
+const parseChineseNumber = (text = "") => {
+  const str = String(text).trim()
+  if (!str) return null
+  if (/^\d+$/.test(str)) return parseInt(str, 10)
+  if (str === "十") return 10
+  if (str.startsWith("十")) {
+    const tail = CHINESE_NUM_MAP[str[1]] || 0
+    return 10 + tail
+  }
+  if (str.includes("十")) {
+    const [head, tail] = str.split("十")
+    const tens = CHINESE_NUM_MAP[head] || 0
+    const units = CHINESE_NUM_MAP[tail] || 0
+    return tens * 10 + units
+  }
+  return CHINESE_NUM_MAP[str] ?? null
+}
+
+const toChineseNumber = (num) => {
+  const n = Number(num)
+  if (!Number.isFinite(n) || n <= 0) return ""
+  const digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"]
+  if (n < 10) return digits[n]
+  if (n === 10) return "十"
+  if (n < 20) return `十${digits[n - 10]}`
+  if (n < 100) {
+    const tens = Math.floor(n / 10)
+    const units = n % 10
+    return `${digits[tens]}十${units ? digits[units] : ""}`
+  }
+  return String(n)
+}
+
+const stripSeasonSuffix = (title = "") =>
+  String(title)
+    .replace(
+      /(?:第\s*[一二两三四五六七八九十百\d]+\s*[季部]|Season\s*\d+|S\d{1,2})/gi,
+      "",
+    )
+    .replace(/\s+/g, " ")
+    .trim()
+
+const parseSeasonInfo = (text = "") => {
+  if (!text) return null
+  const value = String(text)
+  let match = value.match(/第\s*([一二两三四五六七八九十百\d]+)\s*[季部]/i)
+  if (match) {
+    const n = parseChineseNumber(match[1])
+    if (n && n > 0) return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
+  }
+
+  match = value.match(/\bSeason\s*([0-9]{1,2})\b/i)
+  if (match) {
+    const n = parseInt(match[1], 10)
+    if (n > 0) return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
+  }
+
+  match = value.match(/\bS0*([0-9]{1,2})\b/i)
+  if (match) {
+    const n = parseInt(match[1], 10)
+    if (n > 0) return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
+  }
+
+  return null
+}
+
+const buildSeasonCards = (videoDoc) => {
+  const sources = Array.isArray(videoDoc.sources) ? videoDoc.sources : []
+  if (sources.length === 0) return []
+
+  const baseTitle = stripSeasonSuffix(videoDoc.title || "")
+  const groups = new Map()
+
+  for (const source of sources) {
+    const sourceName = source.vod_name || videoDoc.title || ""
+    const seasonInfo =
+      parseSeasonInfo(sourceName) ||
+      parseSeasonInfo(source.remarks || "") ||
+      parseSeasonInfo(videoDoc.title || "")
+
+    const key = seasonInfo ? `s_${seasonInfo.season_no}` : `raw_${sourceName}`
+    if (!groups.has(key)) {
+      groups.set(key, {
+        season_no: seasonInfo?.season_no || null,
+        season_label: seasonInfo?.season_label || "",
+        items: [],
+      })
+    }
+    groups.get(key).items.push(source)
+  }
+
+  const cards = []
+  for (const [, group] of groups) {
+    const sorted = [...group.items].sort(
+      (a, b) => getPriorityIndex(a.source_key) - getPriorityIndex(b.source_key),
+    )
+    const primary = sorted[0]
+    const epCount = String(primary?.vod_play_url || "")
+      .split("#")
+      .filter(Boolean).length
+    const title =
+      group.season_no && baseTitle
+        ? `${baseTitle} ${group.season_label}`
+        : primary?.vod_name || videoDoc.title
+
+    cards.push({
+      id: String(videoDoc._id),
+      title,
+      poster: videoDoc.poster,
+      rating: toSafeRating(videoDoc.rating),
+      year: videoDoc.year,
+      category: videoDoc.category,
+      remarks:
+        epCount > 0 ? `${group.season_label || ""} ${epCount}集`.trim() : primary?.remarks || "",
+      source_ref:
+        primary?.source_key && primary?.vod_id
+          ? `${primary.source_key}::${primary.vod_id}`
+          : "",
+      season_no: group.season_no,
+      season_label: group.season_label,
+    })
+  }
+
+  cards.sort((a, b) => {
+    const ta = stripSeasonSuffix(a.title)
+    const tb = stripSeasonSuffix(b.title)
+    if (ta !== tb) return ta.localeCompare(tb)
+    const sa = a.season_no ?? Number.MAX_SAFE_INTEGER
+    const sb = b.season_no ?? Number.MAX_SAFE_INTEGER
+    return sa - sb
+  })
+
+  return cards
+}
+
+const getPriorityIndex = (sourceKey) => {
+  const index = PRIORITY_LIST.indexOf(sourceKey)
+  return index === -1 ? 999 : index
+}
+
+const extractPrimaryPlayUrl = (vodPlayUrl = "") => {
+  if (!vodPlayUrl) return ""
+  const firstEpisode = String(vodPlayUrl).split("#")[0] || ""
+  const parts = firstEpisode.split("$")
+  return (parts.length > 1 ? parts[1] : parts[0] || "").trim()
+}
+
+const probeSource = async (url) => {
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return { health: "unknown", latency_ms: null }
+  }
+
+  const start = Date.now()
+  try {
+    await axios.get(url, {
+      timeout: SOURCE_PROBE_TIMEOUT_MS,
+      maxRedirects: 3,
+      responseType: "stream",
+      validateStatus: (status) => status >= 200 && status < 500,
+      ...getAxiosConfig(),
+    })
+    return { health: "good", latency_ms: Date.now() - start }
+  } catch (error) {
+    return { health: "bad", latency_ms: null }
+  }
+}
+
+const enrichAndSortSources = async (rawSources = []) => {
+  if (!Array.isArray(rawSources) || rawSources.length === 0) return []
+
+  const tested = await Promise.all(
+    rawSources.map(async (source) => {
+      const plainSource =
+        source && typeof source.toObject === "function"
+          ? source.toObject()
+          : source && source._doc
+            ? source._doc
+            : { ...source }
+      const sampleUrl = extractPrimaryPlayUrl(source.vod_play_url)
+      const probe = await probeSource(sampleUrl)
+      return {
+        ...plainSource,
+        health: probe.health,
+        latency_ms: probe.latency_ms,
+      }
+    }),
+  )
+
+  tested.sort((a, b) => {
+    const healthRank = { good: 0, unknown: 1, bad: 2 }
+    const healthA = healthRank[a.health] ?? 1
+    const healthB = healthRank[b.health] ?? 1
+    if (healthA !== healthB) return healthA - healthB
+
+    const latencyA =
+      typeof a.latency_ms === "number" ? a.latency_ms : Number.MAX_SAFE_INTEGER
+    const latencyB =
+      typeof b.latency_ms === "number" ? b.latency_ms : Number.MAX_SAFE_INTEGER
+    if (latencyA !== latencyB) return latencyA - latencyB
+
+    return getPriorityIndex(a.source_key) - getPriorityIndex(b.source_key)
+  })
+
+  return tested
 }
 
 const success = (res, data) => res.json({ code: 200, message: "success", data })
@@ -17,18 +245,10 @@ const fail = (res, msg = "Error", code = 500) =>
 // 辅助函数：统一返回格式
 const formatDetail = (video) => {
   // 👇 2. 新增排序逻辑
-  let finalSources = video.sources || []
+  let finalSources = Array.isArray(video.sources) ? [...video.sources] : []
   if (finalSources.length > 1) {
     finalSources.sort((a, b) => {
-      // 获取源在优先级列表中的位置 (找不到返回 -1)
-      let indexA = PRIORITY_LIST.indexOf(a.source_key)
-      let indexB = PRIORITY_LIST.indexOf(b.source_key)
-
-      // 如果配置里没写的源，放到最后面 (给 999 权重)
-      if (indexA === -1) indexA = 999
-      if (indexB === -1) indexB = 999
-
-      return indexA - indexB // 升序排列，index 越小越靠前
+      return getPriorityIndex(a.source_key) - getPriorityIndex(b.source_key)
     })
   }
 
@@ -64,9 +284,10 @@ const formatDetail = (video) => {
 
 exports.getVideos = async (req, res) => {
   try {
-    const { cat, tag, area, year, sort, pg = 1, wd } = req.query
+    const { cat, tag, area, year, sort, pg = 1, wd, view } = req.query
     const limit = 20
     const skip = (parseInt(pg) - 1) * limit
+    const shouldSeasonView = view === "season" && !!wd
 
     // ==========================================
     // 1. 构建筛选条件 ($match)
@@ -156,8 +377,8 @@ exports.getVideos = async (req, res) => {
         matchStage.vote_count = { $gt: 0 } // 至少有人评过分
       }
     } else if (sort === "year" || sort === "time") {
-      // 📅 按年份排序
-      sortStage = { year: -1, updatedAt: -1 }
+      // 📅 时间排序优先使用真实上映日期 (date) 和年份 (year)
+      sortStage = { date: -1, year: -1, updatedAt: -1 }
     } else {
       // 🕒 默认：按更新时间 (最新入库/更新的在前面)
       sortStage = { updatedAt: -1 }
@@ -166,26 +387,29 @@ exports.getVideos = async (req, res) => {
     // ==========================================
     // 4. 执行聚合查询 (Aggregation)
     // ==========================================
+    const projectStage = {
+      _id: 1,
+      title: 1,
+      poster: 1,
+      rating: 1,
+      year: 1,
+      date: 1,
+      remarks: 1,
+      tags: 1,
+      category: 1,
+      updatedAt: 1,
+    }
+    if (shouldSeasonView) {
+      projectStage.sources = 1
+    }
+
     const pipeline = [
       { $match: matchStage }, // 1. 筛选
       { $sort: sortStage }, // 2. 排序
       { $skip: skip }, // 3. 跳页
       { $limit: limit }, // 4. 限制数量
       {
-        $project: {
-          // 5. 输出字段控制 (只取需要的，减少传输量)
-          _id: 1, // 必须取 _id，后面才能转换
-          title: 1,
-          poster: 1,
-          rating: 1,
-          year: 1,
-          remarks: 1,
-          tags: 1,
-          category: 1,
-          updatedAt: 1,
-          // 如果需要判断来源，可取 sources
-          // sources: 1
-        },
+        $project: projectStage,
       },
     ]
 
@@ -194,7 +418,7 @@ exports.getVideos = async (req, res) => {
     // ==========================================
     // 5. 数据格式化 (清洗返回给前端的数据)
     // ==========================================
-    const formattedList = list.map((item) => ({
+    let formattedList = list.map((item) => ({
       ...item,
       // 🆔 ID 映射：把 MongoDB 的 _id 对象转为字符串 id
       id: item._id.toString(),
@@ -202,11 +426,19 @@ exports.getVideos = async (req, res) => {
       _id: undefined,
 
       // ⭐ 评分格式化：保留1位小数 (7.56 -> 7.6, 8 -> 8.0由前端处理或保持8)
-      rating: item.rating ? parseFloat(item.rating.toFixed(1)) : 0,
+      rating: toSafeRating(item.rating),
+      date: item.date || "",
 
       // 📅 年份防呆：如果是 2026 这种未来年份，如果不希望显示，可以在这里处理
       // year: item.year > new Date().getFullYear() + 1 ? 0 : item.year
     }))
+
+    if (shouldSeasonView) {
+      const seasonCards = list.flatMap((item) => buildSeasonCards(item))
+      if (seasonCards.length > 0) {
+        formattedList = seasonCards
+      }
+    }
 
     // ==========================================
     // 6. 返回结果
@@ -352,6 +584,7 @@ exports.getDetail = async (req, res) => {
     // 步骤 D: 格式化数据并返回
     // ==========================================
     const result = formatDetail(video)
+    result.sources = await enrichAndSortSources(result.sources)
 
     // 写入缓存
     await setCache(cacheKey, result, 600)

@@ -42,6 +42,25 @@ function isYearSafe(localYear, tmdbDateStr) {
   return Math.abs(localYear - tmdbYear) <= 1
 }
 
+function normalizeTitle(text = "") {
+  return String(text)
+    .toLowerCase()
+    .replace(/[\s:：·\-—_'"`~!@#$%^&*()（）[\]{}<>《》,，。.?？、\\/|]+/g, "")
+}
+
+function scoreTitle(localTitle = "", tmdbTitle = "") {
+  const a = normalizeTitle(localTitle)
+  const b = normalizeTitle(tmdbTitle)
+  if (!a || !b) return 0
+  if (a === b) return 1
+  if (a.includes(b) || b.includes(a)) return 0.8
+  let common = 0
+  for (const ch of new Set(a.split(""))) {
+    if (b.includes(ch)) common++
+  }
+  return common / Math.max(a.length, b.length)
+}
+
 async function markAsDone(id) {
   try {
     await Video.updateOne({ _id: id }, { $set: { is_enriched: true } })
@@ -103,6 +122,7 @@ async function enrichSingleVideo(video) {
 
     // 匹配
     let bestMatch = null
+    let bestScore = -1
     const localYear = video.year
 
     for (const item of results) {
@@ -110,12 +130,11 @@ async function enrichSingleVideo(video) {
       let isLocalTv = ["tv", "anime", "variety"].includes(video.category)
 
       const tmdbTitle = item.title || item.name
-      const isTitleExact = tmdbTitle === cleanTitle
+      const titleScore = scoreTitle(cleanTitle, tmdbTitle)
 
-      if (!isTitleExact) {
-        if (isLocalMovie && item.media_type !== "movie") continue
-        if (isLocalTv && item.media_type !== "tv") continue
-      }
+      if (isLocalMovie && item.media_type !== "movie") continue
+      if (isLocalTv && item.media_type !== "tv") continue
+      if (titleScore < 0.45) continue
 
       const releaseDate = item.release_date || item.first_air_date
       if (!releaseDate) continue
@@ -129,16 +148,14 @@ async function enrichSingleVideo(video) {
         if (localYear >= tmdbYear - 1) isYearMatch = true
       }
 
-      if (isTitleExact && isYearMatch) {
+      const totalScore = titleScore + (isYearMatch ? 0.2 : 0)
+      if (totalScore > bestScore) {
         bestMatch = item
-        break
-      }
-      if (!bestMatch && isYearMatch) {
-        bestMatch = item
+        bestScore = totalScore
       }
     }
 
-    if (!bestMatch) {
+    if (!bestMatch || bestScore < 0.45) {
       // 兜底：尝试完全匹配标题
       bestMatch = results.find(
         (item) => (item.title || item.name) === cleanTitle,
@@ -247,6 +264,7 @@ function buildUpdateData(localVideo, match, details) {
       parseInt(
         (match.release_date || match.first_air_date || "").substring(0, 4),
       ) || localVideo.year,
+    date: match.release_date || match.first_air_date || localVideo.date || "",
     category: match.media_type === "movie" ? "movie" : "tv",
     director: directors,
     actors: cast,

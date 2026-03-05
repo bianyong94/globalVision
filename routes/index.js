@@ -6,6 +6,7 @@ const userRoutes = require("./user.routes")
 const tmdbController = require("../controllers/tmdbController")
 const systemController = require("../controllers/systemController")
 const videoController = require("../controllers/videoController") // 为了 detail
+const imageController = require("../controllers/imageController")
 
 // 挂载路由
 router.use("/v2", videoRoutes)
@@ -20,6 +21,7 @@ router.use("/", userRoutes) // /api/auth/..., /api/user/...
 // TMDB
 router.get("/v2/tmdb/netflix", tmdbController.getNetflix)
 router.get("/v2/tmdb/top_rated", tmdbController.getTopRated)
+router.get("/image/proxy", imageController.proxyImage)
 
 // AI (注意：限流中间件在 server.js 引用或在这里引用)
 const { aiLimiter } = require("../middleware/rateLimit")
