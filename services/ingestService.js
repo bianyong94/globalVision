@@ -1,83 +1,152 @@
-// services/ingestService.js
-const tmdbApi = require("./tmdb") // 你的 TMDB 封装
+const tmdbApi = require("./tmdb")
 const Video = require("../models/Video")
 const { classifyVideo } = require("../utils/classifier")
 
-const meta = classifyVideo(rawItem)
+const normalizeTitle = (text = "") =>
+  String(text)
+    .toLowerCase()
+    .replace(/第[0-9一二三四五六七八九十百]+[季部]/g, "")
+    .replace(/s\d{1,2}/gi, "")
+    .replace(/(国语|tc|hd|中字|蓝光|4k|1080p|2160p|未删减|完整版).*/gi, "")
+    .replace(/[\s:：·\-—_'"`~!@#$%^&*()（）[\]{}<>《》,，。.?？、\\/|]+/g, "")
+    .trim()
+
+const titleLike = (a = "", b = "") => {
+  const na = normalizeTitle(a)
+  const nb = normalizeTitle(b)
+  if (!na || !nb) return false
+  return na.includes(nb) || nb.includes(na)
+}
+
+const buildSourceDoc = (cmsData, sourceKey) => ({
+  source_key: sourceKey,
+  vod_id: String(cmsData.vod_id || ""),
+  vod_name: cmsData.vod_name || "",
+  vod_play_from: cmsData.vod_play_from || "",
+  vod_play_url: cmsData.vod_play_url || "",
+  remarks: cmsData.vod_remarks || "",
+  updatedAt: new Date(),
+})
+
+const inferCategory = (cmsData) => {
+  const meta = classifyVideo(cmsData || {})
+  if (meta?.category) return meta.category
+  const raw = String(cmsData?.type_name || "")
+  if (/综艺|晚会/i.test(raw)) return "variety"
+  if (/动漫|动画|番剧/i.test(raw)) return "anime"
+  if (/剧|连续剧|电视剧/i.test(raw)) return "tv"
+  return "movie"
+}
 
 async function ingestVideo(cmsData, sourceKey) {
-  // 1. 简单清洗 CMS 标题
-  const cleanTitle = cmsData.vod_name
-    .replace(/(国语|TC|HD|中字|蓝光|4K).*/g, "")
-    .trim()
-  const cmsYear = parseInt(cmsData.vod_year)
+  if (!cmsData || !cmsData.vod_id || !cmsData.vod_name) return null
 
-  // 2. 尝试从库里找是否已经存在该资源源 (更新逻辑)
+  const cleanTitle = String(cmsData.vod_name)
+    .replace(/(国语|TC|HD|中字|蓝光|4K|1080P|2160P).*/gi, "")
+    .trim()
+  const cmsYear = parseInt(cmsData.vod_year, 10)
+
+  // 1) 源级唯一命中：同源同vod_id直接更新
   let video = await Video.findOne({
-    "sources.source_key": sourceKey,
-    "sources.source_id": cmsData.vod_id,
+    sources: {
+      $elemMatch: {
+        source_key: sourceKey,
+        vod_id: String(cmsData.vod_id),
+      },
+    },
   })
 
   if (video) {
-    // === 更新逻辑 ===
-    // 既然已经匹配过，就只更新播放地址，绝对不改标题
-    const sourceIdx = video.sources.findIndex(
-      (s) => s.source_key === sourceKey && s.source_id === cmsData.vod_id
+    const idx = video.sources.findIndex(
+      (s) => s.source_key === sourceKey && String(s.vod_id) === String(cmsData.vod_id),
     )
-    video.sources[sourceIdx].play_url = cmsData.vod_play_url
-    video.sources[sourceIdx].remarks = cmsData.vod_remarks
-    await video.save()
-    console.log(`♻️ 更新资源: ${video.title} [${sourceKey}]`)
-    return
+    if (idx >= 0) {
+      video.sources[idx].vod_name = cmsData.vod_name || video.sources[idx].vod_name
+      video.sources[idx].vod_play_from =
+        cmsData.vod_play_from || video.sources[idx].vod_play_from
+      video.sources[idx].vod_play_url =
+        cmsData.vod_play_url || video.sources[idx].vod_play_url
+      video.sources[idx].remarks = cmsData.vod_remarks || video.sources[idx].remarks
+      video.sources[idx].updatedAt = new Date()
+      await video.save()
+      return video
+    }
   }
 
-  // 3. 如果没存过，去 TMDB 找身份证 (新增逻辑)
+  // 2) TMDB 命中聚合
+  let tmdbResult = null
   try {
-    const tmdbResult = await tmdbApi.search(
-      cleanTitle,
-      cmsYear,
-      cmsData.type_id
-    ) // 需自行封装
+    tmdbResult = await tmdbApi.search(cleanTitle, cmsYear, cmsData.type_id)
+  } catch (_) {
+    tmdbResult = null
+  }
 
-    if (!tmdbResult) {
-      console.warn(`🗑️ 无法匹配 TMDB，丢弃: ${cleanTitle}`)
-      return
-    }
+  const newSource = buildSourceDoc(cmsData, sourceKey)
 
-    // 4. 再次查找数据库有没有这个 TMDB ID (防止重复创建)
+  if (tmdbResult?.id) {
     video = await Video.findOne({ tmdb_id: tmdbResult.id })
-
-    const newSource = {
-      source_key: sourceKey,
-      source_id: cmsData.vod_id,
-      source_name: cmsData.vod_name, // 保留原名备查
-      remarks: cmsData.vod_remarks,
-      play_url: cmsData.vod_play_url,
+    if (video) {
+      const exists = video.sources.some(
+        (s) => s.source_key === sourceKey && String(s.vod_id) === String(cmsData.vod_id),
+      )
+      if (!exists) {
+        video.sources.push(newSource)
+        await video.save()
+      }
+      return video
     }
 
-    if (video) {
-      // 库里有这电影(比如已有红牛源)，现在加上非凡源
+    return Video.create({
+      tmdb_id: tmdbResult.id,
+      category: tmdbResult.media_type === "movie" ? "movie" : "tv",
+      title: tmdbResult.title || tmdbResult.name || cmsData.vod_name,
+      original_title: tmdbResult.original_title || tmdbResult.original_name || "",
+      poster: tmdbResult.poster_path || "",
+      year: parseInt(
+        (tmdbResult.release_date || tmdbResult.first_air_date || "").slice(0, 4),
+        10,
+      ) || cmsYear || undefined,
+      overview: tmdbResult.overview || "",
+      sources: [newSource],
+      is_enriched: false,
+    })
+  }
+
+  // 3) TMDB 兜底失败：尽量合并到本地同标题条目，而不是直接丢弃
+  video = await Video.findOne({ title: new RegExp(cleanTitle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i") })
+  if (!video) {
+    video = await Video.findOne({ year: cmsYear || undefined }).sort({ updatedAt: -1 })
+    if (video && !titleLike(video.title, cmsData.vod_name)) {
+      video = null
+    }
+  }
+
+  if (video) {
+    const exists = video.sources.some(
+      (s) => s.source_key === sourceKey && String(s.vod_id) === String(cmsData.vod_id),
+    )
+    if (!exists) {
       video.sources.push(newSource)
       await video.save()
-      console.log(`➕ 追加源: ${video.title}`)
-    } else {
-      // 库里完全没有，新建 TMDB 标准档案
-      await Video.create({
-        tmdb_id: tmdbResult.id,
-        category: tmdbResult.media_type, // 'movie' or 'tv'
-        title: tmdbResult.title || tmdbResult.name,
-        original_title: tmdbResult.original_title || tmdbResult.original_name,
-        poster: tmdbResult.poster_path,
-        year: parseInt(
-          tmdbResult.release_date?.substring(0, 4) ||
-            tmdbResult.first_air_date?.substring(0, 4)
-        ),
-        overview: tmdbResult.overview,
-        sources: [newSource],
-      })
-      console.log(`✨ 新建档案: ${tmdbResult.title}`)
     }
-  } catch (e) {
-    console.error("入库失败", e)
+    return video
   }
+
+  return Video.create({
+    category: inferCategory(cmsData),
+    title: cmsData.vod_name,
+    original_title: "",
+    poster: cmsData.vod_pic || "",
+    year: Number.isFinite(cmsYear) ? cmsYear : undefined,
+    overview: cmsData.vod_content || "",
+    area: cmsData.vod_area || "",
+    actors: cmsData.vod_actor || "",
+    director: cmsData.vod_director || "",
+    sources: [newSource],
+    is_enriched: false,
+  })
+}
+
+module.exports = {
+  ingestVideo,
 }

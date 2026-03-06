@@ -7,6 +7,21 @@ const { getAxiosConfig } = require("../utils/httpAgent")
 // 🎯 配置：你需要去这三个网站（这里以 key 代表，需对应 sources.js 的配置）
 const TARGET_SOURCES = ["feifan", "liangzi", "maotai"]
 
+const normalizeTitle = (text = "") =>
+  String(text)
+    .toLowerCase()
+    .replace(/第[0-9一二三四五六七八九十百]+[季部]/g, "")
+    .replace(/s\d{1,2}/gi, "")
+    .replace(/[\s:：·\-—_'"`~!@#$%^&*()（）[\]{}<>《》,，。.?？、\\/|]+/g, "")
+    .trim()
+
+const isLikelySameTitle = (a = "", b = "") => {
+  const na = normalizeTitle(a)
+  const nb = normalizeTitle(b)
+  if (!na || !nb) return false
+  return na.includes(nb) || nb.includes(na)
+}
+
 // 封装为导出函数
 exports.runSupplementTask = async () => {
   console.log("⏰ [Cron] 开始执行定时补全任务...")
@@ -30,7 +45,7 @@ exports.runSupplementTask = async () => {
       let isModified = false
 
       // 获取当前已有的源，防止重复
-      const existingKeys = video.sources.map((s) => s.source_key)
+      const existingKeys = (video.sources || []).map((s) => s.source_key)
 
       // 遍历 3 个目标网站
       for (const targetKey of TARGET_SOURCES) {
@@ -52,15 +67,20 @@ exports.runSupplementTask = async () => {
           const list = res.data?.list || []
 
           // 🛡️ 判断逻辑 2: 严格名称匹配
-          const match = list.find((item) => item.vod_name === video.title)
+          const match = list.find((item) =>
+            isLikelySameTitle(item.vod_name, video.title),
+          )
 
           if (match) {
             // 找到了新源，加入数据库
             video.sources.push({
               source_key: targetKey,
-              source_name: sourceConfig.name,
+              vod_id: String(match.vod_id || ""),
+              vod_name: match.vod_name || video.title,
+              vod_play_from: match.vod_play_from || "",
               vod_play_url: match.vod_play_url,
               remarks: match.vod_remarks,
+              updatedAt: new Date(),
             })
             isModified = true
             console.log(

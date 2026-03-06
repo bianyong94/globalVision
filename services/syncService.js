@@ -13,6 +13,21 @@ const BACKFILL_SOURCES = ["feifan", "liangzi"]
 // 📝 断点记录文件路径 (放在项目根目录或同级目录)
 const CHECKPOINT_FILE = path.join(process.cwd(), "backfill_checkpoint.txt")
 
+const normalizeTitle = (text = "") =>
+  String(text)
+    .toLowerCase()
+    .replace(/第[0-9一二三四五六七八九十百]+[季部]/g, "")
+    .replace(/s\d{1,2}/gi, "")
+    .replace(/[\s:：·\-—_'"`~!@#$%^&*()（）[\]{}<>《》,，。.?？、\\/|]+/g, "")
+    .trim()
+
+const isLikelySameTitle = (a = "", b = "") => {
+  const na = normalizeTitle(a)
+  const nb = normalizeTitle(b)
+  if (!na || !nb) return false
+  return na.includes(nb) || nb.includes(na)
+}
+
 // ----------------------------------------------------------------
 // 🛠️ 基础逻辑：单条数据匹配入库
 // ----------------------------------------------------------------
@@ -20,7 +35,7 @@ async function processExternalItem(sourceKey, item) {
   try {
     const video = await Video.findOne({ title: item.vod_name })
     if (video) {
-      const existingKeys = video.sources.map((s) => s.source_key)
+      const existingKeys = (video.sources || []).map((s) => s.source_key)
       if (!existingKeys.includes(sourceKey)) {
         video.sources.push({
           source_key: sourceKey,
@@ -56,10 +71,7 @@ exports.runSmartBackfill = async () => {
 
   // 2. 构建查询条件
   const query = {
-    $or: [
-      { "sources.source_key": { $ne: "feifan" } },
-      { "sources.source_key": { $ne: "liangzi" } },
-    ],
+    "sources.source_key": { $nin: BACKFILL_SOURCES },
   }
 
   // 如果有断点，只查断点之后的数据
@@ -184,7 +196,9 @@ async function processBatch(videos) {
 
           // 3. 调试：如果有列表，但没匹配上，说明片名不一致
           // 这里我们稍微放宽一点匹配逻辑，打印出来看看差异
-          const match = list.find((item) => item.vod_name === video.title)
+          const match = list.find((item) =>
+            isLikelySameTitle(item.vod_name, video.title),
+          )
 
           if (match) {
             video.sources.push({

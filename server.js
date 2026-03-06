@@ -2,21 +2,17 @@ require("dotenv").config()
 const express = require("express")
 const cors = require("cors")
 const compression = require("compression")
-const cron = require("node-cron")
 
 // Config & DB
 const connectDB = require("./config/db")
 const { initRedis } = require("./config/redis")
-const { syncTask } = require("./scripts/sync")
 const { runEnrichTask } = require("./scripts/enrich")
+const { runSmartBackfill } = require("./services/syncService")
 const {
-  runSmartBackfill,
-  syncRecentUpdates,
-} = require("./services/syncService")
+  startResourceUpdateScheduler,
+} = require("./services/resourceUpdateScheduler")
 
 // const seoMiddleware = require("./middleware/seo")
-// 1. 🔥🔥🔥 补全丢失的模型引入
-const Video = require("./models/Video")
 
 // Middleware
 const { apiLimiter } = require("./middleware/rateLimit")
@@ -57,6 +53,8 @@ app.use(
       "http://localhost:5173",
       "http://localhost:5174",
       "http://localhost:5175",
+      "http://localhost:5176",
+      "http://localhost:5177",
       "http://localhost:3000",
 
       // 5. 允许所有 IP (如果你想允许局域网调试)
@@ -81,73 +79,21 @@ app.use((err, req, res, next) => {
   res.status(500).json({ code: 500, message: "Server Internal Error" })
 })
 
-// 6. 智能同步函数
-const checkAndSync = async () => {
-  try {
-    const count = await Video.countDocuments()
-    console.log(`📊 当前数据库视频数量: ${count}`)
-
-    // 🔥 读取环境变量 (在 Zeabur 变量里设置)
-    // START_PAGE: 从第几页开始跑 (例如 1761)
-    // SYNC_MODE: 'full' 强制跑全量
-    const startPage = process.env.START_PAGE
-      ? parseInt(process.env.START_PAGE)
-      : 1
-    const syncMode = process.env.SYNC_MODE
-
-    // if (syncMode === "full") {
-    //   console.log(`🔥🔥🔥 强制触发 [全量采集] (从第 ${startPage} 页开始)...`)
-    //   syncTask(876000, startPage).catch((e) => console.error(e))
-    // }
-    if (count === 0) {
-      console.log("✨ 数据库为空，自动触发 [全量采集]...")
-      syncTask(876000, 1).catch((e) => console.error(e))
-    } else {
-      console.log("🔄 自动触发 [增量采集] (最近6小时)...")
-      syncTask(6).catch((e) => console.error(e))
-    }
-
-    const dirtyCount = await Video.countDocuments({
-      is_enriched: false,
-      tmdb_id: { $ne: -1 },
-    })
-
-    if (dirtyCount > 0) {
-      console.log(`🧹 发现 ${dirtyCount} 条未清洗数据，启动后台清洗任务...`)
-      // 不使用 await，让它在后台慢慢跑，不要阻塞 Server 启动太久
-      runEnrichTask(false).catch((e) => console.error("清洗任务出错:", e))
-    } else {
-      console.log("✅ 所有数据已清洗")
-    }
-  } catch (e) {
-    console.error("检查数据库状态失败:", e)
-  }
-}
-
-// 7. Start Server (放在最后)
+// 6. Start Server (放在最后)
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`)
-  // 启动后执行检查
+
   if (process.env.NODE_ENV === "production") {
     setTimeout(async () => {
-      // 1. 智能补全：只针对缺源的旧数据
-      // 下次重启时，因为数据已补全，pendingCount 为 0，会直接跳过，符合你的要求
-      await runSmartBackfill()
+      if (String(process.env.BACKFILL_ON_BOOT || "false") === "true") {
+        await runSmartBackfill()
+      }
 
-      // 2. 增量同步：防止部署期间的漏单
-      console.log("📅 [Init] 检查最近更新...")
-      await syncRecentUpdates(24)
+      if (String(process.env.ENRICH_ON_BOOT || "false") === "true") {
+        runEnrichTask(false).catch((e) => console.error("清洗任务出错:", e))
+      }
     }, 5000)
 
-    // 3. 定时任务：每4小时增量更新
-    setInterval(() => {
-      syncRecentUpdates(6)
-    }, 14400000)
+    startResourceUpdateScheduler()
   }
-})
-
-// Cron (定时任务)
-cron.schedule("0 */2 * * *", () => {
-  console.log("⏰ 定时任务触发：开始增量采集...")
-  // if (process.env.NODE_ENV === "production") syncTask(3)
 })

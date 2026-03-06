@@ -45,7 +45,15 @@ module.exports = {
   CATEGORY_RELATIONS,
 
   // 优先级列表 (搜索排序用)
-  PRIORITY_LIST: ["feifan", "liangzi", "maotai", "hongniu"],
+  PRIORITY_LIST: [
+    "feifan",
+    "liangzi",
+    "jszy",
+    "guangsu",
+    "wujin",
+    "maotai",
+    "hongniu",
+  ],
 
   sources: {
     // ===========================
@@ -74,10 +82,31 @@ module.exports = {
       id_map: MAP_STANDARD,
       home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
     },
+    // 🧭 极速资源
+    jszy: {
+      name: "极速资源",
+      url: "https://jszyapi.com/api.php/provide/vod/from/jsm3u8/",
+      id_map: MAP_STANDARD,
+      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
+    },
     // 🐂 红牛资源
     hongniu: {
       name: "红牛资源",
       url: "https://www.hongniuzy2.com/api.php/provide/vod/from/hnm3u8/",
+      id_map: MAP_STANDARD,
+      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
+    },
+    // ⚡ 光速资源
+    guangsu: {
+      name: "光速资源",
+      url: "https://api.guangsuapi.com/api.php/provide/vod/from/gsm3u8/",
+      id_map: MAP_STANDARD,
+      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
+    },
+    // ♾️ 无尽资源
+    wujin: {
+      name: "无尽资源",
+      url: "https://api.wjcjapi.com/api.php/provide/vod/from/wjm3u8/",
       id_map: MAP_STANDARD,
       home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
     },
