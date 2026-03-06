@@ -2,6 +2,7 @@ require("dotenv").config()
 const express = require("express")
 const cors = require("cors")
 const compression = require("compression")
+const path = require("path")
 
 // Config & DB
 const connectDB = require("./config/db")
@@ -11,6 +12,9 @@ const { runSmartBackfill } = require("./services/syncService")
 const {
   startResourceUpdateScheduler,
 } = require("./services/resourceUpdateScheduler")
+const {
+  startRatingBackfillScheduler,
+} = require("./services/ratingBackfillScheduler")
 
 // const seoMiddleware = require("./middleware/seo")
 
@@ -67,6 +71,27 @@ app.use(
 )
 app.use(express.json())
 
+// APK 更新静态目录: /app-update/tv/*
+// 例如:
+// https://api.bycurry.cc/app-update/tv/latest.json
+// https://api.bycurry.cc/app-update/tv/GlobalVisionTV-v1.0.3-release.apk
+app.use(
+  "/app-update/tv",
+  express.static(path.join(__dirname, "app-update", "tv"), {
+    maxAge: "7d",
+    etag: true,
+    index: false,
+    setHeaders(res, filePath) {
+      if (filePath.endsWith("latest.json")) {
+        res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+      }
+      if (filePath.endsWith(".apk")) {
+        res.setHeader("Content-Type", "application/vnd.android.package-archive")
+      }
+    },
+  }),
+)
+
 // 全局 API 限流
 app.use("/api/", apiLimiter)
 
@@ -95,5 +120,6 @@ app.listen(PORT, "0.0.0.0", () => {
     }, 5000)
 
     startResourceUpdateScheduler()
+    startRatingBackfillScheduler()
   }
 })

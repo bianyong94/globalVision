@@ -1,0 +1,8 @@
+{
+  "versionName": "1.0.0",
+  "versionCode": 1,
+  "apkUrl": "https://api.bycurry.cc/app-update/tv/GlobalVisionTV-v1.0.0-release.apk",
+  "force": false,
+  "publishedAt": "2026-03-06 14:11:00 +08:00",
+  "notes": ["初始化 TV 版本"]
+}

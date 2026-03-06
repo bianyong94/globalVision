@@ -34,7 +34,7 @@ async function fetchListByPage(sourceConfig, hours, page) {
 
 async function runForSource(sourceKey, options) {
   const sourceConfig = sources[sourceKey]
-  if (!sourceConfig) return { scanned: 0, ingested: 0, failed: 0, pages: 0 }
+  if (!sourceConfig) return { scanned: 0, ingested: 0, skipped: 0, failed: 0, pages: 0 }
 
   const maxPages = options.maxPages
   const pageSleepMs = options.pageSleepMs
@@ -42,6 +42,7 @@ async function runForSource(sourceKey, options) {
 
   let scanned = 0
   let ingested = 0
+  let skipped = 0
   let failed = 0
   let pages = 0
 
@@ -67,8 +68,9 @@ async function runForSource(sourceKey, options) {
       }
 
       try {
-        await ingestVideo(item, sourceKey)
-        ingested += 1
+        const saved = await ingestVideo(item, sourceKey)
+        if (saved) ingested += 1
+        else skipped += 1
       } catch (error) {
         failed += 1
         console.error(
@@ -82,7 +84,7 @@ async function runForSource(sourceKey, options) {
     }
   }
 
-  return { scanned, ingested, failed, pages }
+  return { scanned, ingested, skipped, failed, pages }
 }
 
 async function runResourceUpdateJob(trigger = "manual") {
@@ -108,6 +110,7 @@ async function runResourceUpdateJob(trigger = "manual") {
 
   let totalScanned = 0
   let totalIngested = 0
+  let totalSkipped = 0
   let totalFailed = 0
 
   try {
@@ -119,15 +122,16 @@ async function runResourceUpdateJob(trigger = "manual") {
       const stat = await runForSource(sourceKey, options)
       totalScanned += stat.scanned
       totalIngested += stat.ingested
+      totalSkipped += stat.skipped
       totalFailed += stat.failed
       console.log(
-        `[ResourceSync] ${sourceKey} 完成 | pages=${stat.pages} scanned=${stat.scanned} ingested=${stat.ingested} failed=${stat.failed}`,
+        `[ResourceSync] ${sourceKey} 完成 | pages=${stat.pages} scanned=${stat.scanned} ingested=${stat.ingested} skipped=${stat.skipped} failed=${stat.failed}`,
       )
     }
 
     const ms = Date.now() - startedAt
     console.log(
-      `[ResourceSync] 全部完成 | scanned=${totalScanned} ingested=${totalIngested} failed=${totalFailed} costMs=${ms}`,
+      `[ResourceSync] 全部完成 | scanned=${totalScanned} ingested=${totalIngested} skipped=${totalSkipped} failed=${totalFailed} costMs=${ms}`,
     )
   } catch (error) {
     console.error(`[ResourceSync] 任务失败: ${error.message}`)

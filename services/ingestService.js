@@ -1,6 +1,8 @@
 const tmdbApi = require("./tmdb")
 const Video = require("../models/Video")
 const { classifyVideo } = require("../utils/classifier")
+const { shouldBlockShortDrama } = require("../utils/shortDramaFilter")
+const { evaluateAdultContent } = require("../utils/adultContentFilter")
 
 const normalizeTitle = (text = "") =>
   String(text)
@@ -40,6 +42,14 @@ const inferCategory = (cmsData) => {
 
 async function ingestVideo(cmsData, sourceKey) {
   if (!cmsData || !cmsData.vod_id || !cmsData.vod_name) return null
+  const adult = evaluateAdultContent(cmsData, sourceKey)
+  if (adult.blocked) return null
+  const shortDrama = await shouldBlockShortDrama(cmsData, sourceKey)
+  if (shortDrama.blocked) {
+    return null
+  }
+  const classified = classifyVideo(cmsData || {})
+  if (!classified) return null
 
   const cleanTitle = String(cmsData.vod_name)
     .replace(/(国语|TC|HD|中字|蓝光|4K|1080P|2160P).*/gi, "")
@@ -91,8 +101,20 @@ async function ingestVideo(cmsData, sourceKey) {
       )
       if (!exists) {
         video.sources.push(newSource)
-        await video.save()
       }
+      if (Number(tmdbResult.vote_average || 0) > 0) {
+        video.rating = Number(tmdbResult.vote_average)
+      }
+      if (Number(tmdbResult.vote_count || 0) > 0) {
+        video.vote_count = Number(tmdbResult.vote_count)
+      }
+      const releaseDate = tmdbResult.release_date || tmdbResult.first_air_date || ""
+      if (releaseDate && !video.date) video.date = releaseDate
+      const releaseYear = parseInt(String(releaseDate).slice(0, 4), 10)
+      if (Number.isFinite(releaseYear) && !video.year) video.year = releaseYear
+      if (tmdbResult.poster_path && !video.poster) video.poster = tmdbResult.poster_path
+      if (tmdbResult.backdrop_path && !video.backdrop) video.backdrop = tmdbResult.backdrop_path
+      await video.save()
       return video
     }
 
@@ -106,7 +128,12 @@ async function ingestVideo(cmsData, sourceKey) {
         (tmdbResult.release_date || tmdbResult.first_air_date || "").slice(0, 4),
         10,
       ) || cmsYear || undefined,
+      date: tmdbResult.release_date || tmdbResult.first_air_date || "",
       overview: tmdbResult.overview || "",
+      rating: Number(tmdbResult.vote_average || 0),
+      vote_count: Number(tmdbResult.vote_count || 0),
+      backdrop: tmdbResult.backdrop_path || "",
+      tags: Array.isArray(classified.tags) ? classified.tags : [],
       sources: [newSource],
       is_enriched: false,
     })
@@ -133,7 +160,7 @@ async function ingestVideo(cmsData, sourceKey) {
   }
 
   return Video.create({
-    category: inferCategory(cmsData),
+    category: classified.category || inferCategory(cmsData),
     title: cmsData.vod_name,
     original_title: "",
     poster: cmsData.vod_pic || "",
@@ -142,6 +169,7 @@ async function ingestVideo(cmsData, sourceKey) {
     area: cmsData.vod_area || "",
     actors: cmsData.vod_actor || "",
     director: cmsData.vod_director || "",
+    tags: Array.isArray(classified.tags) ? classified.tags : [],
     sources: [newSource],
     is_enriched: false,
   })

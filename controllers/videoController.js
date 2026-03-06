@@ -5,6 +5,8 @@ const { getAxiosConfig } = require("../utils/httpAgent")
 const { sources, PRIORITY_LIST } = require("../config/sources")
 const axios = require("axios")
 const mongoose = require("mongoose")
+const { shouldBlockShortDrama } = require("../utils/shortDramaFilter")
+const { evaluateAdultContent } = require("../utils/adultContentFilter")
 
 const SOURCE_PROBE_TIMEOUT_MS = 2500
 const CHINESE_NUM_MAP = {
@@ -293,6 +295,32 @@ exports.getVideos = async (req, res) => {
     // 1. 构建筛选条件 ($match)
     // ==========================================
     const matchStage = {}
+    const andConditions = [
+      { title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i } },
+      {
+        title: {
+          $not: /(^|\b)(av|AV在线|成人视频|无码|有码|番号|carib|heyzo|fc2|pornhub|xvideos|国产自拍|偷拍|偷拍自拍|换妻|自拍偷拍|做爱实录)(\b|$)/i,
+        },
+      },
+      {
+        $or: [
+          { tags: { $exists: false } },
+          {
+            tags: {
+              $nin: [
+                "短剧",
+                "微短剧",
+                "爽剧",
+                "爽文",
+                "miniseries",
+                "成人",
+                "AV",
+              ],
+            },
+          },
+        ],
+      },
+    ]
 
     // 🔍 关键词搜索
     if (wd) {
@@ -320,7 +348,7 @@ exports.getVideos = async (req, res) => {
       const targetYear = parseInt(year)
       if (!isNaN(targetYear)) {
         // 兼容数字和字符串两种存储情况
-        matchStage.$or = [{ year: targetYear }, { year: String(targetYear) }]
+        andConditions.push({ $or: [{ year: targetYear }, { year: String(targetYear) }] })
         // 如果你的数据库year字段确定全是数字，则保留原样即可
       }
     }
@@ -356,11 +384,15 @@ exports.getVideos = async (req, res) => {
         matchStage.tags = { $regex: new RegExp(tag, "i") }
       }
     }
+    if (andConditions.length > 0) {
+      matchStage.$and = andConditions
+    }
 
     // ==========================================
     // 3. 构建排序逻辑 ($sort)
     // ==========================================
     let sortStage = {}
+    let useCompositeSort = false
 
     // 优先处理明确的排序指令
     if (sort === "rating" || (tag && tag.toLowerCase() === "high_score")) {
@@ -380,8 +412,15 @@ exports.getVideos = async (req, res) => {
       // 📅 时间排序优先使用真实上映日期 (date) 和年份 (year)
       sortStage = { date: -1, year: -1, updatedAt: -1 }
     } else {
-      // 🕒 默认：按更新时间 (最新入库/更新的在前面)
-      sortStage = { updatedAt: -1 }
+      // 🔥 默认综合排序：更新时间 + 热度
+      // 热度由 rating + vote_count + 源数量共同决定
+      useCompositeSort = true
+      sortStage = {
+        _composite_score: -1,
+        updatedAt: -1,
+        vote_count: -1,
+        rating: -1,
+      }
     }
 
     // ==========================================
@@ -403,15 +442,62 @@ exports.getVideos = async (req, res) => {
       projectStage.sources = 1
     }
 
-    const pipeline = [
-      { $match: matchStage }, // 1. 筛选
-      { $sort: sortStage }, // 2. 排序
-      { $skip: skip }, // 3. 跳页
-      { $limit: limit }, // 4. 限制数量
-      {
-        $project: projectStage,
-      },
-    ]
+    const pipeline = [{ $match: matchStage }] // 1. 筛选
+
+    if (useCompositeSort) {
+      pipeline.push({
+        $addFields: {
+          _rating_safe: { $ifNull: ["$rating", 0] },
+          _vote_count_safe: { $ifNull: ["$vote_count", 0] },
+          _source_count: { $size: { $ifNull: ["$sources", []] } },
+          _freshness_score: {
+            $max: [
+              0,
+              {
+                $subtract: [
+                  100,
+                  {
+                    $multiply: [
+                      {
+                        $divide: [
+                          {
+                            $subtract: [
+                              "$$NOW",
+                              { $ifNull: ["$updatedAt", new Date(0)] },
+                            ],
+                          },
+                          86400000,
+                        ],
+                      },
+                      2,
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      })
+      pipeline.push({
+        $addFields: {
+          _composite_score: {
+            $add: [
+              { $multiply: ["$_rating_safe", 12] },
+              { $multiply: [{ $ln: { $add: ["$_vote_count_safe", 1] } }, 4] },
+              { $multiply: [{ $min: ["$_source_count", 5] }, 2] },
+              "$_freshness_score",
+            ],
+          },
+        },
+      })
+    }
+
+    pipeline.push({ $sort: sortStage }) // 2. 排序
+    pipeline.push({ $skip: skip }) // 3. 跳页
+    pipeline.push({ $limit: limit }) // 4. 限制数量
+    pipeline.push({
+      $project: projectStage,
+    })
 
     const list = await Video.aggregate(pipeline)
 
@@ -463,7 +549,7 @@ exports.getHome = async (req, res) => {
         }
       })
     // 并行查询，速度极快
-    const [banners, netflix, shortDrama, highRateTv, newMovies] =
+    const [banners, netflix, hotTv, highRateTv, newMovies] =
       await Promise.all([
         // 轮播图：取最近更新的 4K 电影或 Netflix 剧集
         Video.find({
@@ -480,9 +566,12 @@ exports.getHome = async (req, res) => {
           .limit(10)
           .select("title poster remarks uniq_id id"),
 
-        // Section 2: 热门短剧 (专门筛选 miniseries 标签)
-        Video.find({ tags: "miniseries" })
-          .sort({ updatedAt: -1 })
+        // Section 2: 热门剧集更新
+        Video.find({
+          category: "tv",
+          title: { $not: /短剧|微短剧|爽剧|爽文|赘婿/i },
+        })
+          .sort({ updatedAt: -1, rating: -1 })
           .limit(10)
           .select("title poster remarks uniq_id"),
 
@@ -516,7 +605,7 @@ exports.getHome = async (req, res) => {
         banners: fixId(banners),
         sections: [
           { title: "Netflix 精选", type: "scroll", data: fixId(netflix) },
-          { title: "爆火短剧", type: "grid", data: fixId(shortDrama) },
+          { title: "热门剧集", type: "grid", data: fixId(hotTv) },
           { title: "口碑美剧", type: "grid", data: fixId(highRateTv) },
           { title: "院线新片", type: "grid", data: fixId(newMovies) },
         ],
@@ -626,10 +715,17 @@ exports.searchSources = async (req, res) => {
 
         // 4. 过滤与匹配逻辑
         // 资源站搜索是模糊的，我们需要过滤掉不相关的
-        const validItems = list.filter((item) => {
+        const matchedItems = list.filter((item) => {
           // 简单包含关系，忽略大小写
           return item.vod_name.toLowerCase().includes(title.toLowerCase())
         })
+        const validItems = []
+        for (const item of matchedItems) {
+          const adult = evaluateAdultContent(item, key)
+          if (adult.blocked) continue
+          const judge = await shouldBlockShortDrama(item, key)
+          if (!judge.blocked) validItems.push(item)
+        }
 
         // 5. 格式化返回数据
         return validItems.map((item) => ({
@@ -890,12 +986,19 @@ exports.ingestVideo = async (req, res) => {
         const list = response.data?.list || []
 
         // 🔥 核心修复 1：双向模糊匹配，忽略大小写
-        const validItems = list.filter((item) => {
+        const matchedItems = list.filter((item) => {
           const vName = item.vod_name.toLowerCase()
           const tName = title.toLowerCase()
           // 只要资源站的名字包含搜索词，或者搜索词包含资源站名字，都算命中！
           return vName.includes(tName) || tName.includes(vName)
         })
+        const validItems = []
+        for (const item of matchedItems) {
+          const adult = evaluateAdultContent(item, key)
+          if (adult.blocked) continue
+          const judge = await shouldBlockShortDrama(item, key)
+          if (!judge.blocked) validItems.push(item)
+        }
 
         if (validItems.length > 0) {
           console.log(

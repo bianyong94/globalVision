@@ -2,6 +2,7 @@
  * utils/classifier.js
  * 核心分类与标签提取器
  */
+const { evaluateAdultContent } = require("./adultContentFilter")
 
 // 辅助：计算集数
 const countEpisodes = (urlStr) => {
@@ -28,7 +29,8 @@ const classifyVideo = (item) => {
 
   // 🛡️ 0. 黑名单拦截 (过滤垃圾数据)
   // 针对 "伦理", "福利", "解说" 等绝对不要的内容
-  if (/福利|写真|解说/.test(rawType) || /AV|三级|解说/.test(rawName)) {
+  const adult = evaluateAdultContent(item, item?.source_key || "")
+  if (adult.blocked || /解说/.test(rawType) || /解说/.test(rawName)) {
     return null
   }
 
@@ -117,6 +119,7 @@ const classifyVideo = (item) => {
     灾难: /灾难|逃生|巨兽/,
     冒险: /冒险|探险|寻宝/,
     短剧: /短剧|微剧|爽文|赘婿/, // 专门给短剧打标
+    情色: /情色|情欲|伦理|禁忌|欲望|香艳/,
   }
 
   const combinedText = `${rawType} ${rawName} ${remarks}`

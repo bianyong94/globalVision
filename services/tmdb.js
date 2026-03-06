@@ -105,7 +105,12 @@ async function search(title, year, typeId) {
       release_date: best.release_date || "",
       first_air_date: best.first_air_date || "",
       overview: best.overview || "",
+      vote_average: Number(best.vote_average || 0),
+      vote_count: Number(best.vote_count || 0),
       poster_path: best.poster_path ? `${IMAGE_BASE_URL}${best.poster_path}` : "",
+      backdrop_path: best.backdrop_path
+        ? `https://image.tmdb.org/t/p/w1280${best.backdrop_path}`
+        : "",
     }
   } catch (error) {
     console.error(`[TMDB] search failed: ${error.message}`)
