@@ -5,7 +5,7 @@ const { getAxiosConfig } = require("../utils/httpAgent")
 const { sources, PRIORITY_LIST } = require("../config/sources")
 const axios = require("axios")
 const mongoose = require("mongoose")
-const { shouldBlockShortDrama } = require("../utils/shortDramaFilter")
+const { shouldBlockShortDrama, scoreShortDrama } = require("../utils/shortDramaFilter")
 const { evaluateAdultContent } = require("../utils/adultContentFilter")
 
 const SOURCE_PROBE_TIMEOUT_MS = 2500
@@ -32,6 +32,62 @@ const toSafeRating = (value) => {
   const n = Number(value)
   if (!Number.isFinite(n) || n <= 0) return 0
   return parseFloat(n.toFixed(1))
+}
+
+const buildHomeSeed = () => {
+  const now = new Date()
+  return now.getFullYear() * 1000 + (now.getMonth() + 1) * 50 + now.getDate()
+}
+
+const rotateList = (arr = [], seed = 0) => {
+  if (!Array.isArray(arr) || arr.length === 0) return []
+  const offset = Math.abs(seed) % arr.length
+  if (offset === 0) return arr
+  return [...arr.slice(offset), ...arr.slice(0, offset)]
+}
+
+const uniqById = (arr = []) => {
+  const used = new Set()
+  return arr.filter((item) => {
+    const id = String(item?._id || item?.id || "")
+    if (!id || used.has(id)) return false
+    used.add(id)
+    return true
+  })
+}
+
+const HOME_NOISE_REGEX =
+  /豪门后妈|人生赢家|神豪|赘婿|逆袭|娇妻|千金|龙王|战神|闪婚|前妻|下山|师姐|仙尊|大凶之兆|最强收徒/i
+
+const isHighQualityHomeItem = (doc = {}) => {
+  const text = `${doc.title || ""} ${doc.remarks || ""} ${doc.latest_remarks || ""}`
+  if (HOME_NOISE_REGEX.test(text)) return false
+
+  const judged = scoreShortDrama(
+    {
+      vod_name: doc.title || "",
+      vod_remarks: `${doc.remarks || ""} ${doc.latest_remarks || ""} ${(doc.tags || []).join(" ")}`,
+      vod_area: doc.area || "",
+      vod_year: doc.year || "",
+      vod_play_url: Array.isArray(doc.sources) ? doc.sources[0]?.vod_play_url || "" : "",
+    },
+    "",
+  )
+
+  if (judged.blocked) return false
+  return true
+}
+
+const pickUniqueFromPool = (pool, usedSet, limit, seed) => {
+  const picked = []
+  for (const item of rotateList(pool, seed)) {
+    const id = String(item?._id || item?.id || "")
+    if (!id || usedSet.has(id)) continue
+    usedSet.add(id)
+    picked.push(item)
+    if (picked.length >= limit) break
+  }
+  return picked
 }
 
 const parseChineseNumber = (text = "") => {
@@ -538,77 +594,96 @@ exports.getVideos = async (req, res) => {
 
 exports.getHome = async (req, res) => {
   try {
+    const homeSeed = buildHomeSeed()
     const fixId = (queryResult) =>
       queryResult.map((item) => {
-        // item 可能是 mongoose document，需要转成普通对象
         const doc = item._doc || item
         return {
           ...doc,
-          // ✅ 核心：把 uniq_id 赋值给 id
           id: doc.uniq_id || doc.id || doc._id,
+          remarks: doc.remarks || doc.latest_remarks || "",
+          rating: toSafeRating(doc.rating),
         }
       })
-    // 并行查询，速度极快
-    const [banners, netflix, hotTv, highRateTv, newMovies] =
+
+    const baseSelect =
+      "_id title poster backdrop remarks latest_remarks year rating vote_count tags category area updatedAt sources"
+
+    const [heroPoolRaw, latestTvRaw, latestMovieRaw, highTvRaw, highMovieRaw] =
       await Promise.all([
-        // 轮播图：取最近更新的 4K 电影或 Netflix 剧集
         Video.find({
-          category: "movie",
-          $or: [{ tags: "4k" }, { year: new Date().getFullYear() }],
+          title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i },
+          category: { $in: ["movie", "tv", "anime"] },
         })
-          .sort({ updatedAt: -1 }) // 按更新时间排
-          .limit(5)
-          .select("title poster tags remarks uniq_id id"),
-
-        // 2. Netflix 栏目 -> 改为 "精选欧美剧" (如果没有 netflix 标签，就查欧美分类)
-        Video.find({ tags: "netflix" })
-          .sort({ rating: -1, updatedAt: -1 })
-          .limit(10)
-          .select("title poster remarks uniq_id id"),
-
-        // Section 2: 热门剧集更新
+          .sort({ rating: -1, vote_count: -1, updatedAt: -1 })
+          .limit(80)
+          .select(baseSelect)
+          .lean(),
         Video.find({
+          title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i },
           category: "tv",
-          title: { $not: /短剧|微短剧|爽剧|爽文|赘婿/i },
         })
-          .sort({ updatedAt: -1, rating: -1 })
-          .limit(10)
-          .select("title poster remarks uniq_id"),
-
-        // Section 3: 高分美剧 (分类+标签+评分排序)
+          .sort({ updatedAt: -1, vote_count: -1, rating: -1 })
+          .limit(80)
+          .select(baseSelect)
+          .lean(),
         Video.find({
-          category: "tv",
-          // 只要标签里沾边的都算，增加命中率
-          tags: {
-            $in: ["欧美", "美剧", "netflix", "hbo", "apple_tv", "disney"],
-          },
-          // rating: { $gt: 0 } // 暂时只要求有分就行，先别要求太高，看有没有数据
-        })
-          .sort({ rating: -1 })
-          .limit(10)
-          .select("title poster rating uniq_id"),
-
-        // Section 4: 院线新片
-        // 5. 院线新片 -> 只要是电影且年份是今年或去年
-        Video.find({
+          title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i },
           category: "movie",
-          year: { $gte: new Date().getFullYear() - 1 },
         })
-          .sort({ updatedAt: -1 })
-          .limit(12)
-          .select("title poster remarks uniq_id id"),
+          .sort({ updatedAt: -1, vote_count: -1, rating: -1 })
+          .limit(80)
+          .select(baseSelect)
+          .lean(),
+        Video.find({
+          title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i },
+          category: "tv",
+          rating: { $gte: 7.2 },
+          vote_count: { $gte: 20 },
+        })
+          .sort({ rating: -1, vote_count: -1, updatedAt: -1 })
+          .limit(80)
+          .select(baseSelect)
+          .lean(),
+        Video.find({
+          title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i },
+          category: "movie",
+          rating: { $gte: 7.2 },
+          vote_count: { $gte: 20 },
+        })
+          .sort({ rating: -1, vote_count: -1, updatedAt: -1 })
+          .limit(80)
+          .select(baseSelect)
+          .lean(),
       ])
+
+    const heroPool = heroPoolRaw.filter(isHighQualityHomeItem)
+    const latestTvPool = latestTvRaw.filter(isHighQualityHomeItem)
+    const latestMoviePool = latestMovieRaw.filter(isHighQualityHomeItem)
+    const highTvPool = highTvRaw.filter(isHighQualityHomeItem)
+    const highMoviePool = highMovieRaw.filter(isHighQualityHomeItem)
+
+    const heroCandidates = uniqById([...heroPool, ...latestTvPool, ...latestMoviePool])
+    const banners = rotateList(heroCandidates, homeSeed).slice(0, 8)
+    const used = new Set(banners.map((x) => String(x._id)))
+
+    const latestTvPicked = pickUniqueFromPool(latestTvPool, used, 14, homeSeed + 11)
+    const latestMoviePicked = pickUniqueFromPool(latestMoviePool, used, 14, homeSeed + 23)
+    const highTvPicked = pickUniqueFromPool(highTvPool, used, 14, homeSeed + 31)
+    const highMoviePicked = pickUniqueFromPool(highMoviePool, used, 14, homeSeed + 41)
+
+    const sections = [
+      { title: "最新热门剧集", type: "scroll", data: fixId(latestTvPicked) },
+      { title: "最新热门电影", type: "scroll", data: fixId(latestMoviePicked) },
+      { title: "高分口碑剧集", type: "scroll", data: fixId(highTvPicked) },
+      { title: "高分口碑电影", type: "scroll", data: fixId(highMoviePicked) },
+    ].filter((section) => section.data.length > 0)
 
     res.json({
       code: 200,
       data: {
         banners: fixId(banners),
-        sections: [
-          { title: "Netflix 精选", type: "scroll", data: fixId(netflix) },
-          { title: "热门剧集", type: "grid", data: fixId(hotTv) },
-          { title: "口碑美剧", type: "grid", data: fixId(highRateTv) },
-          { title: "院线新片", type: "grid", data: fixId(newMovies) },
-        ],
+        sections,
       },
     })
   } catch (e) {
