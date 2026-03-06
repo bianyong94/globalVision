@@ -115,7 +115,7 @@ app.listen(PORT, "0.0.0.0", () => {
       }
 
       if (String(process.env.ENRICH_ON_BOOT || "false") === "true") {
-        runEnrichTask(false).catch((e) => console.error("清洗任务出错:", e))
+        runEnrichTask(false).catch((e) => console.error("清洗任务出错了:", e))
       }
     }, 5000)
 
