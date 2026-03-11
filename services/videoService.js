@@ -15,8 +15,7 @@ const tryFetchFromSource = async (sourceKey, buildParams) => {
 
   const response = await axios.get(source.url, {
     params: buildParams(sourceKey),
-    timeout: 9000,
-    ...getAxiosConfig(),
+    ...getAxiosConfig({ timeout: 9000 }),
   })
 
   const data = response?.data

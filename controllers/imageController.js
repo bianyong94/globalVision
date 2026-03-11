@@ -116,7 +116,6 @@ exports.proxyImage = async (req, res) => {
 
     const upstream = await axios.get(parsed.toString(), {
       responseType: "stream",
-      timeout: 10000,
       maxRedirects: 3,
       validateStatus: (status) => status >= 200 && status < 500,
       headers: {
@@ -125,7 +124,7 @@ exports.proxyImage = async (req, res) => {
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: parsed.origin,
       },
-      ...getAxiosConfig(),
+      ...getAxiosConfig({ timeout: 10000 }),
     })
 
     if (upstream.status >= 400) {

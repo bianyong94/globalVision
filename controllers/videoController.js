@@ -5,7 +5,10 @@ const { getAxiosConfig } = require("../utils/httpAgent")
 const { sources, PRIORITY_LIST } = require("../config/sources")
 const axios = require("axios")
 const mongoose = require("mongoose")
-const { shouldBlockShortDrama, scoreShortDrama } = require("../utils/shortDramaFilter")
+const {
+  shouldBlockShortDrama,
+  scoreShortDrama,
+} = require("../utils/shortDramaFilter")
 const { evaluateAdultContent } = require("../utils/adultContentFilter")
 
 const SOURCE_PROBE_TIMEOUT_MS = 2500
@@ -72,7 +75,9 @@ const isHighQualityHomeItem = (doc = {}) => {
       vod_remarks: `${doc.remarks || ""} ${doc.latest_remarks || ""} ${(doc.tags || []).join(" ")}`,
       vod_area: doc.area || "",
       vod_year: doc.year || "",
-      vod_play_url: Array.isArray(doc.sources) ? doc.sources[0]?.vod_play_url || "" : "",
+      vod_play_url: Array.isArray(doc.sources)
+        ? doc.sources[0]?.vod_play_url || ""
+        : "",
     },
     "",
   )
@@ -141,19 +146,22 @@ const parseSeasonInfo = (text = "") => {
   let match = value.match(/第\s*([一二两三四五六七八九十百\d]+)\s*[季部]/i)
   if (match) {
     const n = parseChineseNumber(match[1])
-    if (n && n > 0) return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
+    if (n && n > 0)
+      return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
   }
 
   match = value.match(/\bSeason\s*([0-9]{1,2})\b/i)
   if (match) {
     const n = parseInt(match[1], 10)
-    if (n > 0) return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
+    if (n > 0)
+      return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
   }
 
   match = value.match(/\bS0*([0-9]{1,2})\b/i)
   if (match) {
     const n = parseInt(match[1], 10)
-    if (n > 0) return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
+    if (n > 0)
+      return { season_no: n, season_label: `第${toChineseNumber(n)}季` }
   }
 
   return null
@@ -206,7 +214,9 @@ const buildSeasonCards = (videoDoc) => {
       year: videoDoc.year,
       category: videoDoc.category,
       remarks:
-        epCount > 0 ? `${group.season_label || ""} ${epCount}集`.trim() : primary?.remarks || "",
+        epCount > 0
+          ? `${group.season_label || ""} ${epCount}集`.trim()
+          : primary?.remarks || "",
       source_ref:
         primary?.source_key && primary?.vod_id
           ? `${primary.source_key}::${primary.vod_id}`
@@ -277,11 +287,10 @@ const probeSource = async (url) => {
   const start = Date.now()
   try {
     await axios.get(url, {
-      timeout: SOURCE_PROBE_TIMEOUT_MS,
       maxRedirects: 3,
       responseType: "stream",
       validateStatus: (status) => status >= 200 && status < 500,
-      ...getAxiosConfig(),
+      ...getAxiosConfig({ timeout: SOURCE_PROBE_TIMEOUT_MS }),
     })
     return { health: "good", latency_ms: Date.now() - start }
   } catch (error) {
@@ -463,7 +472,9 @@ exports.getVideos = async (req, res) => {
       const targetYear = parseInt(year)
       if (!isNaN(targetYear)) {
         // 兼容数字和字符串两种存储情况
-        andConditions.push({ $or: [{ year: targetYear }, { year: String(targetYear) }] })
+        andConditions.push({
+          $or: [{ year: targetYear }, { year: String(targetYear) }],
+        })
         // 如果你的数据库year字段确定全是数字，则保留原样即可
       }
     }
@@ -722,14 +733,33 @@ exports.getHome = async (req, res) => {
     const highTvPool = highTvRaw.filter(isHighQualityHomeItem)
     const highMoviePool = highMovieRaw.filter(isHighQualityHomeItem)
 
-    const heroCandidates = uniqById([...heroPool, ...latestTvPool, ...latestMoviePool])
+    const heroCandidates = uniqById([
+      ...heroPool,
+      ...latestTvPool,
+      ...latestMoviePool,
+    ])
     const banners = rotateList(heroCandidates, homeSeed).slice(0, 8)
     const used = new Set(banners.map((x) => String(x._id)))
 
-    const latestTvPicked = pickUniqueFromPool(latestTvPool, used, 14, homeSeed + 11)
-    const latestMoviePicked = pickUniqueFromPool(latestMoviePool, used, 14, homeSeed + 23)
+    const latestTvPicked = pickUniqueFromPool(
+      latestTvPool,
+      used,
+      14,
+      homeSeed + 11,
+    )
+    const latestMoviePicked = pickUniqueFromPool(
+      latestMoviePool,
+      used,
+      14,
+      homeSeed + 23,
+    )
     const highTvPicked = pickUniqueFromPool(highTvPool, used, 14, homeSeed + 31)
-    const highMoviePicked = pickUniqueFromPool(highMoviePool, used, 14, homeSeed + 41)
+    const highMoviePicked = pickUniqueFromPool(
+      highMoviePool,
+      used,
+      14,
+      homeSeed + 41,
+    )
 
     const sections = [
       { title: "最新热门剧集", type: "scroll", data: fixId(latestTvPicked) },
@@ -841,8 +871,7 @@ exports.searchSources = async (req, res) => {
         // 请求资源站: ac=detail 才能拿到播放地址
         const response = await axios.get(sourceConfig.url, {
           params: { ac: "detail", wd: title },
-          timeout: 6000, // 6秒超时，太慢的源就不要了
-          ...getAxiosConfig(),
+          ...getAxiosConfig({ timeout: 6000 }),
         })
 
         const list = response.data?.list || []
@@ -1114,8 +1143,7 @@ exports.ingestVideo = async (req, res) => {
       try {
         const response = await axios.get(sourceConfig.url, {
           params: { ac: "detail", wd: title },
-          timeout: 8000, // 超时时间稍微拉长一点到 8 秒
-          ...getAxiosConfig(),
+          ...getAxiosConfig({ timeout: 8000 }),
         })
         const list = response.data?.list || []
 
@@ -1246,8 +1274,7 @@ exports.ingestVideoBySource = async (req, res) => {
     try {
       const response = await axios.get(sourceConfig.url, {
         params: { ac: "detail", ids: vod_id },
-        timeout: 8000,
-        ...getAxiosConfig(),
+        ...getAxiosConfig({ timeout: 8000 }),
       })
       list = response.data?.list || []
     } catch (e) {
@@ -1256,8 +1283,7 @@ exports.ingestVideoBySource = async (req, res) => {
     if (!Array.isArray(list) || list.length === 0) {
       const response = await axios.get(sourceConfig.url, {
         params: { ac: "detail", wd: vod_id },
-        timeout: 8000,
-        ...getAxiosConfig(),
+        ...getAxiosConfig({ timeout: 8000 }),
       })
       list = response.data?.list || []
     }
@@ -1280,8 +1306,10 @@ exports.ingestVideoBySource = async (req, res) => {
     let localCategory = "movie"
     const typeName = picked.type_name || ""
     if (typeName.includes("剧")) localCategory = "tv"
-    else if (typeName.includes("综艺") || typeName.includes("晚会")) localCategory = "variety"
-    else if (typeName.includes("动漫") || typeName.includes("动画")) localCategory = "anime"
+    else if (typeName.includes("综艺") || typeName.includes("晚会"))
+      localCategory = "variety"
+    else if (typeName.includes("动漫") || typeName.includes("动画"))
+      localCategory = "anime"
 
     const newVideo = new Video({
       title: picked.vod_name,

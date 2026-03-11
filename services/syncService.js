@@ -181,8 +181,7 @@ async function processBatch(videos) {
 
           const res = await axios.get(sourceConfig.url, {
             params: { ac: "detail", wd: video.title },
-            timeout: 5000,
-            ...getAxiosConfig(),
+            ...getAxiosConfig({ timeout: 5000 }),
           })
 
           const list = res.data?.list || []
@@ -253,8 +252,7 @@ exports.syncRecentUpdates = async (hours = 24) => {
       const config = sources[key]
       const res = await axios.get(config.url, {
         params: { ac: "detail", h: hours },
-        timeout: 10000,
-        ...getAxiosConfig(),
+        ...getAxiosConfig({ timeout: 10000 }),
       })
 
       const list = res.data?.list || []

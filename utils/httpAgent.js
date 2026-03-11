@@ -8,8 +8,12 @@ const httpsAgent = new https.Agent({
   rejectUnauthorized: false,
 })
 
-const getAxiosConfig = () => {
-  const config = { timeout: 6000, httpAgent, httpsAgent }
+const getAxiosConfig = (options = {}) => {
+  const timeoutMsRaw = options?.timeout ?? process.env.AXIOS_TIMEOUT_MS
+  const timeoutMs = Number.parseInt(String(timeoutMsRaw || ""), 10)
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 6000
+
+  const config = { timeout, httpAgent, httpsAgent }
   if (process.env.PROXY_URL) {
     config.httpsAgent = new HttpsProxyAgent(process.env.PROXY_URL)
   }

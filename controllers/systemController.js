@@ -371,8 +371,7 @@ const searchExternalCandidates = async (titleHint = "") => {
     try {
       const response = await axios.get(sourceConfig.url, {
         params: { ac: "detail", wd: title },
-        timeout: 6000,
-        ...getAxiosConfig(),
+        ...getAxiosConfig({ timeout: 6000 }),
       })
       const list = response.data?.list || []
       const matchedItems = list.filter((item) => {

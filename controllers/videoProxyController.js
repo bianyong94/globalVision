@@ -90,7 +90,6 @@ exports.proxyPlaylist = async (req, res) => {
 
   try {
     const upstream = await axios.get(upstreamUrl.toString(), {
-      timeout: 10000,
       maxRedirects: 3,
       responseType: "text",
       validateStatus: (status) => status >= 200 && status < 500,
@@ -100,7 +99,7 @@ exports.proxyPlaylist = async (req, res) => {
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: upstreamUrl.origin,
       },
-      ...getAxiosConfig(),
+      ...getAxiosConfig({ timeout: 10000 }),
     })
 
     if (upstream.status >= 400) {
@@ -177,7 +176,6 @@ exports.proxySegment = async (req, res) => {
 
   try {
     const upstream = await axios.get(upstreamUrl.toString(), {
-      timeout: 20000,
       maxRedirects: 3,
       responseType: "stream",
       validateStatus: (status) => status >= 200 && status < 500,
@@ -189,7 +187,7 @@ exports.proxySegment = async (req, res) => {
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: upstreamUrl.origin,
       },
-      ...getAxiosConfig(),
+      ...getAxiosConfig({ timeout: 20000 }),
     })
 
     if (upstream.status >= 400) {

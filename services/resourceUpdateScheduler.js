@@ -15,7 +15,10 @@ const parseSourceKeys = () => {
     .map((s) => s.trim())
     .filter(Boolean)
 
-  const keys = configured.length > 0 ? configured : PRIORITY_LIST || Object.keys(sources || {})
+  const keys =
+    configured.length > 0
+      ? configured
+      : PRIORITY_LIST || Object.keys(sources || {})
   return keys.filter((key) => Boolean(sources[key]))
 }
 
@@ -25,8 +28,9 @@ let scheduledTask = null
 async function fetchListByPage(sourceConfig, hours, page) {
   const res = await axios.get(sourceConfig.url, {
     params: { ac: "detail", h: hours, pg: page },
-    timeout: toInt(process.env.RESOURCE_SYNC_TIMEOUT_MS, 9000),
-    ...getAxiosConfig(),
+    ...getAxiosConfig({
+      timeout: toInt(process.env.RESOURCE_SYNC_TIMEOUT_MS, 9000),
+    }),
   })
 
   return Array.isArray(res.data?.list) ? res.data.list : []
@@ -34,7 +38,8 @@ async function fetchListByPage(sourceConfig, hours, page) {
 
 async function runForSource(sourceKey, options) {
   const sourceConfig = sources[sourceKey]
-  if (!sourceConfig) return { scanned: 0, ingested: 0, skipped: 0, failed: 0, pages: 0 }
+  if (!sourceConfig)
+    return { scanned: 0, ingested: 0, skipped: 0, failed: 0, pages: 0 }
 
   const maxPages = options.maxPages
   const pageSleepMs = options.pageSleepMs
@@ -51,7 +56,9 @@ async function runForSource(sourceKey, options) {
     try {
       list = await fetchListByPage(sourceConfig, hours, page)
     } catch (error) {
-      console.error(`[ResourceSync] ${sourceKey} page=${page} 拉取失败: ${error.message}`)
+      console.error(
+        `[ResourceSync] ${sourceKey} page=${page} 拉取失败: ${error.message}`,
+      )
       failed += 1
       break
     }
@@ -95,6 +102,11 @@ async function runResourceUpdateJob(trigger = "manual") {
 
   if (running) {
     console.log("[ResourceSync] 跳过: 上一轮任务仍在执行")
+    return
+  }
+
+  if (typeof ingestVideo !== "function") {
+    console.error("[ResourceSync] 任务失败: ingestVideo 未实现")
     return
   }
 
