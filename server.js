@@ -93,7 +93,11 @@ app.use(
 )
 
 // 全局 API 限流
-app.use("/api/", apiLimiter)
+app.use("/api", (req, res, next) => {
+  const p = String(req.path || "")
+  if (p.startsWith("/image/proxy") || p.startsWith("/video/proxy")) return next()
+  return apiLimiter(req, res, next)
+})
 
 // 4. Mount Routes
 app.use("/api", apiRoutes)

@@ -9,6 +9,9 @@ const { shouldBlockShortDrama, scoreShortDrama } = require("../utils/shortDramaF
 const { evaluateAdultContent } = require("../utils/adultContentFilter")
 
 const SOURCE_PROBE_TIMEOUT_MS = 2500
+const SOURCE_PROBE_CACHE_TTL_SEC = 1800
+const SOURCE_PROBE_STALE_MS = 10 * 60 * 1000
+const SOURCE_PROBE_INFLIGHT = new Map()
 const CHINESE_NUM_MAP = {
   零: 0,
   一: 1,
@@ -237,6 +240,35 @@ const extractPrimaryPlayUrl = (vodPlayUrl = "") => {
   return (parts.length > 1 ? parts[1] : parts[0] || "").trim()
 }
 
+const getProbeCacheKey = (url) => {
+  try {
+    const u = new URL(String(url || ""))
+    if (!u.hostname) return null
+    return `source_probe_v1_${u.hostname.toLowerCase()}`
+  } catch (e) {
+    return null
+  }
+}
+
+const scheduleProbeRefresh = (key, url) => {
+  if (!key || !url) return
+  if (SOURCE_PROBE_INFLIGHT.has(key)) return
+  SOURCE_PROBE_INFLIGHT.set(key, true)
+  setImmediate(async () => {
+    try {
+      const probe = await probeSource(url)
+      await setCache(
+        key,
+        { ...probe, updated_at: Date.now() },
+        SOURCE_PROBE_CACHE_TTL_SEC,
+      )
+    } catch (e) {
+    } finally {
+      SOURCE_PROBE_INFLIGHT.delete(key)
+    }
+  })
+}
+
 const probeSource = async (url) => {
   if (!url || !/^https?:\/\//i.test(url)) {
     return { health: "unknown", latency_ms: null }
@@ -260,6 +292,7 @@ const probeSource = async (url) => {
 const enrichAndSortSources = async (rawSources = []) => {
   if (!Array.isArray(rawSources) || rawSources.length === 0) return []
 
+  const cachePromiseByKey = new Map()
   const tested = await Promise.all(
     rawSources.map(async (source) => {
       const plainSource =
@@ -269,7 +302,29 @@ const enrichAndSortSources = async (rawSources = []) => {
             ? source._doc
             : { ...source }
       const sampleUrl = extractPrimaryPlayUrl(source.vod_play_url)
-      const probe = await probeSource(sampleUrl)
+      const key = getProbeCacheKey(sampleUrl)
+      let probe = null
+      if (key) {
+        if (!cachePromiseByKey.has(key)) {
+          cachePromiseByKey.set(key, getCache(key))
+        }
+        const cached = await cachePromiseByKey.get(key)
+        if (cached && typeof cached === "object") {
+          probe = {
+            health: cached.health || "unknown",
+            latency_ms:
+              typeof cached.latency_ms === "number" ? cached.latency_ms : null,
+          }
+          const updatedAt = Number(cached.updated_at || 0)
+          if (!updatedAt || Date.now() - updatedAt > SOURCE_PROBE_STALE_MS) {
+            scheduleProbeRefresh(key, sampleUrl)
+          }
+        } else {
+          scheduleProbeRefresh(key, sampleUrl)
+        }
+      }
+
+      if (!probe) probe = { health: "unknown", latency_ms: null }
       return {
         ...plainSource,
         health: probe.health,
@@ -384,8 +439,12 @@ exports.getVideos = async (req, res) => {
       const regex = new RegExp(safeWd, "i")
       matchStage.$or = [
         { title: regex },
+        { original_title: regex },
         { actors: regex },
         { director: regex },
+        { tags: regex },
+        { overview: regex },
+        { content: regex },
       ]
     }
 
@@ -1156,6 +1215,104 @@ exports.ingestVideo = async (req, res) => {
     })
   } catch (e) {
     console.error("[Ingest Error] 致命错误:", e)
+    return res.json({ code: 500, message: "服务器收录时发生异常" })
+  }
+}
+
+exports.ingestVideoBySource = async (req, res) => {
+  const source_key = String(req.body?.source_key || "").trim()
+  const vod_id = String(req.body?.vod_id || "").trim()
+  if (!source_key || !vod_id) {
+    return res.json({ code: 400, message: "缺少 source_key 或 vod_id" })
+  }
+  if (!sources[source_key]) {
+    return res.json({ code: 400, message: "未知资源站" })
+  }
+
+  try {
+    const existVideo = await Video.findOne({
+      sources: { $elemMatch: { source_key, vod_id } },
+    })
+    if (existVideo) {
+      return res.json({
+        code: 200,
+        message: "该资源已在片库中",
+        id: existVideo._id.toString(),
+      })
+    }
+
+    const sourceConfig = sources[source_key]
+    let list = []
+    try {
+      const response = await axios.get(sourceConfig.url, {
+        params: { ac: "detail", ids: vod_id },
+        timeout: 8000,
+        ...getAxiosConfig(),
+      })
+      list = response.data?.list || []
+    } catch (e) {
+      list = []
+    }
+    if (!Array.isArray(list) || list.length === 0) {
+      const response = await axios.get(sourceConfig.url, {
+        params: { ac: "detail", wd: vod_id },
+        timeout: 8000,
+        ...getAxiosConfig(),
+      })
+      list = response.data?.list || []
+    }
+
+    const picked =
+      list.find((x) => String(x?.vod_id || "") === vod_id) || list[0] || null
+    if (!picked) {
+      return res.json({ code: 404, message: "源站未返回该资源" })
+    }
+
+    const adult = evaluateAdultContent(picked, source_key)
+    if (adult.blocked) {
+      return res.json({ code: 404, message: "资源不可用" })
+    }
+    const judge = await shouldBlockShortDrama(picked, source_key)
+    if (judge.blocked) {
+      return res.json({ code: 404, message: "资源不可用" })
+    }
+
+    let localCategory = "movie"
+    const typeName = picked.type_name || ""
+    if (typeName.includes("剧")) localCategory = "tv"
+    else if (typeName.includes("综艺") || typeName.includes("晚会")) localCategory = "variety"
+    else if (typeName.includes("动漫") || typeName.includes("动画")) localCategory = "anime"
+
+    const newVideo = new Video({
+      title: picked.vod_name,
+      poster: picked.vod_pic,
+      category: localCategory,
+      year: picked.vod_year,
+      area: picked.vod_area,
+      content: picked.vod_content,
+      actors: picked.vod_actor,
+      director: picked.vod_director,
+      remarks: picked.vod_remarks,
+      sources: [
+        {
+          source_key,
+          vod_id: picked.vod_id,
+          vod_name: picked.vod_name,
+          vod_play_from: picked.vod_play_from,
+          vod_play_url: picked.vod_play_url,
+          remarks: picked.vod_remarks,
+        },
+      ],
+    })
+
+    await newVideo.save()
+    return res.json({
+      code: 200,
+      message: "🎉 收录成功！",
+      id: newVideo._id.toString(),
+    })
+  } catch (e) {
+    console.error("[Ingest By Source Error]", e?.message || e)
     return res.json({ code: 500, message: "服务器收录时发生异常" })
   }
 }

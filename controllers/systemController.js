@@ -4,6 +4,10 @@ const { STANDARD_GROUPS, BLACK_LIST } = require("../config/constants")
 const { OpenAI } = require("openai")
 const Video = require("../models/Video")
 const axios = require("axios")
+const { sources, PRIORITY_LIST } = require("../config/sources")
+const { getAxiosConfig } = require("../utils/httpAgent")
+const { evaluateAdultContent } = require("../utils/adultContentFilter")
+const { shouldBlockShortDrama } = require("../utils/shortDramaFilter")
 
 // 1. 初始化大模型客户端 (统一使用 OpenAI 规范调用千问)
 const openai = new OpenAI({
@@ -20,6 +24,25 @@ const fail = (res, msg = "Error", code = 500) =>
 
 const escapeRegex = (value = "") =>
   String(value).replace(/[-\/\\^$*+?.()|[\]{}]/g, "\\$&")
+
+const extractQuotedTitle = (text = "") => {
+  const raw = String(text || "")
+  const m1 = raw.match(/《([^》]{2,50})》/)
+  if (m1?.[1]) return m1[1].trim()
+  const m2 = raw.match(/[“"]([^”"]{2,50})[”"]/)
+  if (m2?.[1]) return m2[1].trim()
+  const m3 = raw.match(/'([^']{2,50})'/)
+  if (m3?.[1]) return m3[1].trim()
+  return ""
+}
+
+const extractYearHint = (text = "") => {
+  const m = String(text || "").match(/(19\d{2}|20\d{2})\s*年/)
+  if (!m?.[1]) return null
+  const y = parseInt(m[1], 10)
+  if (!Number.isFinite(y) || y < 1900 || y > 2100) return null
+  return y
+}
 
 const extractRawQuestion = (question = "") => {
   const quoted =
@@ -69,7 +92,7 @@ const isPersonIntent = (question = "") =>
   /(演的|导演|主演|演员|的剧|的电影|作品)/i.test(String(question))
 
 const isRecommendationIntent = (question = "") =>
-  /(推荐|高分|近期|最新|好看|必看|热门|榜单)/i.test(String(question))
+  /(推荐|高分|近期|最近|最新|好看|必看|热门|榜单|上映|上线)/i.test(String(question))
 
 const searchLocalCandidates = async (queryText, categoryHint) => {
   const safeQuery = escapeRegex(queryText)
@@ -125,25 +148,27 @@ const searchLocalCandidates = async (queryText, categoryHint) => {
   const rows = await Video.find(findQuery)
     .sort({ rating: -1, updatedAt: -1 })
     .limit(24)
-    .select("title year category rating tags updatedAt")
+    .select("title year category rating tags updatedAt poster")
     .lean()
 
   return rows.map((item, index) => ({
-    id: `local_${index}`,
+    id: String(item._id),
     title: item.title,
     year: item.year || "",
     category: item.category || "",
     rating: typeof item.rating === "number" ? item.rating : 0,
+    poster: item.poster || "",
     source: "local",
   }))
 }
 
 const searchTmdbCandidates = async (queryText, categoryHint) => {
-  if (!process.env.TMDB_API_KEY || !queryText) return []
+  if (!process.env.TMDB_API_KEY) return []
   const tmdbCategoryFilter =
     categoryHint === "movie" || categoryHint === "tv" ? categoryHint : null
   const recommendationMode = isRecommendationIntent(queryText)
   const personHint = extractPersonHint(queryText)
+  const yearHint = extractYearHint(queryText)
   try {
     if (personHint) {
       const personRes = await axios.get("https://api.themoviedb.org/3/search/person", {
@@ -183,15 +208,56 @@ const searchTmdbCandidates = async (queryText, categoryHint) => {
           .slice(0, 16)
           .map((item, index) => ({
             id: `tmdb_person_${index}`,
+            tmdb_id: item.id,
             title: item.title || item.name,
             year:
               (item.release_date || item.first_air_date || "").slice(0, 4) || "",
             category: item.media_type || "",
             rating: Number(item.vote_average || 0),
+            poster_path: item.poster_path || "",
             source: "tmdb",
           }))
         if (mapped.length > 0) return mapped
       }
+    }
+
+    if (
+      recommendationMode &&
+      tmdbCategoryFilter === "movie" &&
+      yearHint &&
+      /春节/i.test(queryText)
+    ) {
+      const start = `${yearHint}-01-15`
+      const end = `${yearHint}-03-01`
+      const discoverRes = await axios.get(
+        "https://api.themoviedb.org/3/discover/movie",
+        {
+          params: {
+            api_key: process.env.TMDB_API_KEY,
+            language: "zh-CN",
+            sort_by: "popularity.desc",
+            "primary_release_date.gte": start,
+            "primary_release_date.lte": end,
+            region: "CN",
+            page: 1,
+            include_adult: false,
+          },
+          timeout: 6000,
+        },
+      )
+      const discoverList = Array.isArray(discoverRes.data?.results)
+        ? discoverRes.data.results
+        : []
+      return discoverList.slice(0, 12).map((item, index) => ({
+        id: `tmdb_cny_${index}`,
+        tmdb_id: item.id,
+        title: item.title || item.name,
+        year: (item.release_date || "").slice(0, 4) || "",
+        category: "movie",
+        rating: Number(item.vote_average || 0),
+        poster_path: item.poster_path || "",
+        source: "tmdb",
+      }))
     }
 
     if (
@@ -219,13 +285,17 @@ const searchTmdbCandidates = async (queryText, categoryHint) => {
         : []
       return discoverList.slice(0, 12).map((item, index) => ({
         id: `tmdb_discover_${index}`,
+        tmdb_id: item.id,
         title: item.name || item.title,
         year: (item.first_air_date || "").slice(0, 4) || "",
         category: "tv",
         rating: Number(item.vote_average || 0),
+        poster_path: item.poster_path || "",
         source: "tmdb",
       }))
     }
+
+    if (!queryText) return []
 
     const res = await axios.get("https://api.themoviedb.org/3/search/multi", {
       params: {
@@ -247,11 +317,13 @@ const searchTmdbCandidates = async (queryText, categoryHint) => {
       .slice(0, 12)
       .map((item, index) => ({
         id: `tmdb_${index}`,
+        tmdb_id: item.id,
         title: item.title || item.name,
         year:
           (item.release_date || item.first_air_date || "").slice(0, 4) || "",
         category: item.media_type || "",
         rating: Number(item.vote_average || 0),
+        poster_path: item.poster_path || "",
         source: "tmdb",
       }))
   } catch (error) {
@@ -262,7 +334,10 @@ const searchTmdbCandidates = async (queryText, categoryHint) => {
 const dedupeCandidates = (items = []) => {
   const map = new Map()
   for (const item of items) {
-    const key = `${item.title || ""}_${item.year || ""}`.toLowerCase()
+    const key =
+      item?.source === "external" && item?.source_key && item?.vod_id
+        ? `external_${item.source_key}_${item.vod_id}`
+        : `${item.title || ""}_${item.year || ""}_${item.source || ""}`.toLowerCase()
     if (!key.trim() || map.has(key)) continue
     map.set(key, item)
   }
@@ -275,6 +350,77 @@ const normalizeTitle = (value = "") =>
     .replace(/^\d+[.)、\s-]*/, "")
     .replace(/[。！？!?.]+$/g, "")
     .trim()
+
+const looksLikeDirectTitle = (text = "") => {
+  const t = normalizeTitle(text)
+  if (!t) return false
+  if (t.length < 2 || t.length > 40) return false
+  if (isRecommendationIntent(t) || isPersonIntent(t)) return false
+  if (/[#?=&/]/.test(t)) return false
+  if (/^(我要|帮我|给我|搜索|找|想看|想找|来点)/i.test(t)) return false
+  return true
+}
+
+const searchExternalCandidates = async (titleHint = "") => {
+  const title = normalizeTitle(titleHint)
+  if (!looksLikeDirectTitle(title)) return []
+
+  const allSourceKeys = Object.keys(sources)
+  const tasks = allSourceKeys.map(async (key) => {
+    const sourceConfig = sources[key]
+    try {
+      const response = await axios.get(sourceConfig.url, {
+        params: { ac: "detail", wd: title },
+        timeout: 6000,
+        ...getAxiosConfig(),
+      })
+      const list = response.data?.list || []
+      const matchedItems = list.filter((item) => {
+        const vName = String(item?.vod_name || "").toLowerCase()
+        const tName = String(title || "").toLowerCase()
+        if (!vName || !tName) return false
+        return vName.includes(tName) || tName.includes(vName)
+      })
+      const valid = []
+      for (const item of matchedItems.slice(0, 10)) {
+        const adult = evaluateAdultContent(item, key)
+        if (adult.blocked) continue
+        const judge = await shouldBlockShortDrama(item, key)
+        if (judge.blocked) continue
+        valid.push(item)
+      }
+      return valid.map((item) => ({
+        source: "external",
+        source_key: key,
+        vod_id: String(item.vod_id || ""),
+        title: item.vod_name || "",
+        year: item.vod_year || "",
+        category: item.type_name || "",
+        rating: 0,
+        poster: item.vod_pic || "",
+        remarks: item.vod_remarks || "",
+      }))
+    } catch (e) {
+      return []
+    }
+  })
+
+  const results = await Promise.all(tasks)
+  const flat = results.flat().filter((x) => x && x.vod_id)
+
+  flat.sort((a, b) => {
+    const ia = PRIORITY_LIST.indexOf(a.source_key)
+    const ib = PRIORITY_LIST.indexOf(b.source_key)
+    const pa = ia === -1 ? 999 : ia
+    const pb = ib === -1 ? 999 : ib
+    if (pa !== pb) return pa - pb
+    const ya = Number(a.year || 0)
+    const yb = Number(b.year || 0)
+    return yb - ya
+  })
+
+  return flat.slice(0, 16)
+}
 
 const splitPotentialTitles = (value = "") =>
   String(value)
@@ -294,6 +440,42 @@ const looksLikeGarbage = (title = "") => {
     return true
   }
   return false
+}
+
+const sanitizeCandidateCards = (items = []) => {
+  const unique = new Set()
+  const result = []
+  for (const item of items) {
+    const title = normalizeTitle(item?.title || "")
+    if (looksLikeGarbage(title)) continue
+    const year = String(item?.year || "").trim()
+    const key =
+      item?.source === "external" && item?.source_key && item?.vod_id
+        ? `external_${item.source_key}_${item.vod_id}`
+        : `${title}_${year}_${item?.source || ""}`.toLowerCase()
+    if (unique.has(key)) continue
+    unique.add(key)
+    result.push({
+      ...item,
+      title,
+      year,
+      category: String(item?.category || "").trim(),
+      rating: Number(item?.rating || 0),
+      source:
+        item?.source === "local"
+          ? "local"
+          : item?.source === "external"
+            ? "external"
+            : "tmdb",
+      id: item?.source === "local" ? String(item?.id || "") : undefined,
+      tmdb_id:
+        item?.source === "tmdb" && Number.isFinite(Number(item?.tmdb_id))
+          ? Number(item.tmdb_id)
+          : undefined,
+    })
+    if (result.length >= 8) break
+  }
+  return result
 }
 
 const sanitizeTitleList = (items = []) => {
@@ -451,17 +633,23 @@ exports.askAI = async (req, res) => {
   const cleanQuestion = extractRawQuestion(question)
   if (!cleanQuestion) return success(res, [])
 
+  const quotedTitle = extractQuotedTitle(cleanQuestion)
+  const queryText =
+    quotedTitle || (isRecommendationIntent(cleanQuestion) ? "" : cleanQuestion)
+
   const categoryHint = inferCategory(cleanQuestion)
   const categoryFilter = buildCategoryFilter(categoryHint)
   const personHint = extractPersonHint(cleanQuestion)
   const personIntent = isPersonIntent(cleanQuestion)
 
   try {
-    const [local, tmdb] = await Promise.all([
-      searchLocalCandidates(cleanQuestion, categoryHint),
-      searchTmdbCandidates(cleanQuestion, categoryHint),
+    const titleHint = quotedTitle || (looksLikeDirectTitle(cleanQuestion) ? cleanQuestion : "")
+    const [local, tmdb, external] = await Promise.all([
+      searchLocalCandidates(queryText || cleanQuestion, categoryHint),
+      searchTmdbCandidates(queryText || cleanQuestion, categoryHint),
+      searchExternalCandidates(titleHint),
     ])
-    let candidates = dedupeCandidates([...local, ...tmdb])
+    let candidates = dedupeCandidates([...local, ...tmdb, ...external])
     if (candidates.length === 0 && personIntent && personHint) {
       const personRegex = new RegExp(escapeRegex(personHint), "i")
       const personQuery = {
@@ -524,28 +712,13 @@ exports.askAI = async (req, res) => {
     if (candidates.length === 0) return success(res, [])
 
     const reranked = await rerankByModel(cleanQuestion, candidates)
-    const titles = reranked
-      .map((item) => item.title)
-      .filter(Boolean)
-      .slice(0, 8)
+    const cards = sanitizeCandidateCards(reranked)
+    if (cards.length > 0) return success(res, cards)
 
-    const sanitized = sanitizeTitleList(titles)
-    if (sanitized.length > 0) {
-      return success(res, sanitized)
-    }
+    const fallbackCards = sanitizeCandidateCards(fallbackRank(candidates))
+    if (fallbackCards.length > 0) return success(res, fallbackCards)
 
-    const fallbackTitles = sanitizeTitleList(
-      fallbackRank(candidates)
-        .map((item) => item.title)
-        .filter(Boolean),
-    )
-    if (fallbackTitles.length > 0) return success(res, fallbackTitles)
-
-    const emergencyTitles = candidates
-      .map((item) => normalizeTitle(item.title))
-      .filter((item) => !looksLikeGarbage(item))
-      .slice(0, 8)
-    return success(res, emergencyTitles)
+    return success(res, [])
   } catch (error) {
     console.error("[Zhipu API Error]:", error.message || error)
     success(res, [])
