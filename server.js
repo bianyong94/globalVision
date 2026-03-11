@@ -35,6 +35,35 @@ connectDB()
 app.set("trust proxy", 1)
 // app.use(seoMiddleware)
 app.use(compression())
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint()
+  const originalEnd = res.end
+
+  res.end = function (...args) {
+    try {
+      if (!res.headersSent) {
+        const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6
+        res.setHeader("X-Response-Time", `${elapsedMs.toFixed(1)}ms`)
+      }
+    } catch (e) {}
+    return originalEnd.apply(this, args)
+  }
+
+  res.on("finish", () => {
+    const p = `${req.baseUrl || ""}${req.path || ""}`
+    if (p.startsWith("/api/video/proxy") || p.startsWith("/api/image/proxy")) return
+    const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6
+    const slowMs = Number.parseInt(String(process.env.SLOW_REQUEST_MS || "1200"), 10)
+    const threshold = Number.isFinite(slowMs) && slowMs > 0 ? slowMs : 1200
+    if (elapsedMs >= threshold) {
+      console.warn(
+        `[SlowRequest] ${req.method} ${p} ${res.statusCode} ${elapsedMs.toFixed(1)}ms`,
+      )
+    }
+  })
+
+  next()
+})
 app.use(
   cors({
     // origin: process.env.NODE_ENV === "production" ? "*" : "*",

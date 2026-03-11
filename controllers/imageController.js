@@ -53,8 +53,12 @@ exports.proxyImage = async (req, res) => {
   const url = String(req.query.url || "").trim()
   const qualityRaw = Number(req.query.q)
   const widthRaw = Number(req.query.w)
-  const quality = Number.isFinite(qualityRaw) ? Math.min(95, Math.max(30, qualityRaw)) : 75
-  const width = Number.isFinite(widthRaw) ? Math.min(MAX_IMAGE_WIDTH, Math.max(0, widthRaw)) : 0
+  const quality = Number.isFinite(qualityRaw)
+    ? Math.min(95, Math.max(30, qualityRaw))
+    : 75
+  const width = Number.isFinite(widthRaw)
+    ? Math.min(MAX_IMAGE_WIDTH, Math.max(0, widthRaw))
+    : 0
 
   if (!url) return fail(res, "缺少图片地址", 400)
   if (url.length > MAX_IMAGE_URL_LENGTH) return fail(res, "URL 过长", 400)
@@ -74,6 +78,10 @@ exports.proxyImage = async (req, res) => {
     return fail(res, "目标地址不允许访问", 403)
   }
 
+  let computedCacheFile = ""
+  let computedServedType = "application/octet-stream"
+  let computedEtag = ""
+
   try {
     const format = sharp ? getBestFormat(req.headers.accept) : "origin"
     const cacheDir = path.join(__dirname, "..", ".cache", "images")
@@ -84,6 +92,16 @@ exports.proxyImage = async (req, res) => {
 
     const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
     const etag = `"${cacheKey}"`
+    const servedType =
+      format === "avif"
+        ? "image/avif"
+        : format === "webp"
+          ? "image/webp"
+          : "application/octet-stream"
+
+    computedCacheFile = cacheFile
+    computedServedType = servedType
+    computedEtag = etag
 
     try {
       const st = fs.statSync(cacheFile)
@@ -96,14 +114,11 @@ exports.proxyImage = async (req, res) => {
           return
         }
 
-        const servedType =
-          format === "avif"
-            ? "image/avif"
-            : format === "webp"
-              ? "image/webp"
-              : "application/octet-stream"
         res.setHeader("Content-Type", servedType)
-        res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=2592000")
+        res.setHeader(
+          "Cache-Control",
+          "public, max-age=86400, s-maxage=2592000",
+        )
         res.setHeader("CDN-Cache-Control", "public, max-age=2592000")
         res.setHeader("Vary", "Accept")
         res.setHeader("ETag", etag)
@@ -114,6 +129,7 @@ exports.proxyImage = async (req, res) => {
       }
     } catch (e) {}
 
+    const startedAt = Date.now()
     const upstream = await axios.get(parsed.toString(), {
       responseType: "stream",
       maxRedirects: 3,
@@ -149,9 +165,14 @@ exports.proxyImage = async (req, res) => {
     res.setHeader("Vary", "Accept")
     res.setHeader("ETag", etag)
     res.setHeader("X-Image-Proxy", "globalVision")
+    res.setHeader("X-Upstream-Host", parsed.hostname)
+    res.setHeader("X-Upstream-Status", String(upstream.status))
+    res.setHeader("X-Upstream-TimeMs", String(Date.now() - startedAt))
     res.setHeader(
       "X-Image-Cache-Key",
-      Buffer.from(`${parsed.toString()}|w=${width}|q=${quality}|f=${format}`).toString("base64"),
+      Buffer.from(
+        `${parsed.toString()}|w=${width}|q=${quality}|f=${format}`,
+      ).toString("base64"),
     )
     res.setHeader("X-Image-Cache", "miss")
 
@@ -168,7 +189,51 @@ exports.proxyImage = async (req, res) => {
 
     if (!shouldTransform) {
       res.setHeader("Content-Type", contentType)
-      upstream.data.pipe(res)
+      const upstreamLen = Number(upstream.headers["content-length"] || 0)
+      if (upstreamLen && upstreamLen > MAX_IMAGE_TRANSFORM_BYTES) {
+        upstream.data.pipe(res)
+        return
+      }
+
+      const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
+      const out = new PassThrough()
+      const fileStream = fs.createWriteStream(tmpFile)
+      let cacheAborted = false
+      let seenBytes = 0
+
+      out.on("data", (chunk) => {
+        if (cacheAborted) return
+        seenBytes += chunk?.length || 0
+        if (seenBytes > MAX_IMAGE_TRANSFORM_BYTES) {
+          cacheAborted = true
+          try {
+            fileStream.destroy()
+          } catch (e) {}
+          try {
+            fs.unlinkSync(tmpFile)
+          } catch (e) {}
+        }
+      })
+
+      out.pipe(res)
+      out.pipe(fileStream)
+      upstream.data.pipe(out)
+
+      fileStream.on("finish", () => {
+        if (cacheAborted) return
+        try {
+          fs.renameSync(tmpFile, cacheFile)
+        } catch (e) {
+          try {
+            fs.unlinkSync(tmpFile)
+          } catch (e2) {}
+        }
+      })
+      fileStream.on("error", () => {
+        try {
+          fs.unlinkSync(tmpFile)
+        } catch (e) {}
+      })
       return
     }
 
@@ -184,7 +249,10 @@ exports.proxyImage = async (req, res) => {
     if (format === "avif") transformer.avif({ quality })
     else transformer.webp({ quality })
 
-    res.setHeader("Content-Type", format === "avif" ? "image/avif" : "image/webp")
+    res.setHeader(
+      "Content-Type",
+      format === "avif" ? "image/avif" : "image/webp",
+    )
 
     const out = new PassThrough()
     const fileStream = fs.createWriteStream(cacheFile)
@@ -195,6 +263,31 @@ exports.proxyImage = async (req, res) => {
     fileStream.on("error", () => {})
   } catch (error) {
     console.error("[Image Proxy Error]", error.message || error)
+    try {
+      const st = computedCacheFile ? fs.statSync(computedCacheFile) : null
+      if (st?.size > 0) {
+        const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
+        if (computedEtag && ifNoneMatch && ifNoneMatch === computedEtag) {
+          res.status(304)
+          res.setHeader("ETag", computedEtag)
+          res.end()
+          return
+        }
+
+        res.setHeader("Content-Type", computedServedType)
+        res.setHeader(
+          "Cache-Control",
+          "public, max-age=86400, s-maxage=2592000",
+        )
+        res.setHeader("CDN-Cache-Control", "public, max-age=2592000")
+        res.setHeader("Vary", "Accept")
+        res.setHeader("X-Image-Proxy", "globalVision")
+        res.setHeader("X-Image-Cache", "stale")
+        if (computedEtag) res.setHeader("ETag", computedEtag)
+        fs.createReadStream(computedCacheFile).pipe(res)
+        return
+      }
+    } catch (e) {}
     return res.redirect(parsed.toString())
   }
 }

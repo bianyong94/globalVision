@@ -7,6 +7,7 @@ const { getAxiosConfig } = require("../utils/httpAgent")
 const MAX_URL_LENGTH = 4000
 const HLS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const MAX_CACHE_BYTES = 25 * 1024 * 1024
+const PLAYLIST_CACHE_TTL_MS = 60 * 1000
 
 const fail = (res, msg = "Error", code = 500) =>
   res.status(code).json({ code, message: msg })
@@ -28,7 +29,8 @@ const ensureDir = (dirPath) => {
   } catch (e) {}
 }
 
-const sha1 = (text) => crypto.createHash("sha1").update(String(text)).digest("hex")
+const sha1 = (text) =>
+  crypto.createHash("sha1").update(String(text)).digest("hex")
 
 const parseUpstreamUrl = (raw) => {
   const url = String(raw || "").trim()
@@ -88,13 +90,48 @@ exports.proxyPlaylist = async (req, res) => {
   const upstreamUrl = parseUpstreamUrl(req.query.url)
   if (!upstreamUrl) return fail(res, "无效播放地址", 400)
 
+  const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
+  const cacheDir = path.join(__dirname, "..", ".cache", "hls-playlist")
+  ensureDir(cacheDir)
+  const cacheKey = sha1(upstreamUrl.toString())
+  const cacheFile = path.join(cacheDir, `${cacheKey}.m3u8`)
+  const etag = `"${cacheKey}"`
+
   try {
+    const st = fs.statSync(cacheFile)
+    const fresh = Date.now() - st.mtimeMs < PLAYLIST_CACHE_TTL_MS
+    if (fresh) {
+      if (ifNoneMatch && ifNoneMatch === etag) {
+        res.status(304)
+        res.setHeader("ETag", etag)
+        res.end()
+        return
+      }
+
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.apple.mpegurl; charset=utf-8",
+      )
+      res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60")
+      res.setHeader("CDN-Cache-Control", "public, max-age=60")
+      res.setHeader("ETag", etag)
+      res.setHeader("X-Video-Proxy", "globalVision")
+      res.setHeader("X-Video-Cache", "hit")
+      res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
+      fs.createReadStream(cacheFile).pipe(res)
+      return
+    }
+  } catch (e) {}
+
+  try {
+    const startedAt = Date.now()
     const upstream = await axios.get(upstreamUrl.toString(), {
       maxRedirects: 3,
       responseType: "text",
       validateStatus: (status) => status >= 200 && status < 500,
       headers: {
-        Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
+        Accept:
+          "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: upstreamUrl.origin,
@@ -126,12 +163,54 @@ exports.proxyPlaylist = async (req, res) => {
       })
       .join("\n")
 
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl; charset=utf-8")
+    const elapsedMs = Date.now() - startedAt
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.apple.mpegurl; charset=utf-8",
+    )
     res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60")
     res.setHeader("CDN-Cache-Control", "public, max-age=60")
     res.setHeader("X-Video-Proxy", "globalVision")
+    res.setHeader("X-Video-Cache", "miss")
+    res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
+    res.setHeader("X-Upstream-Status", String(upstream.status))
+    res.setHeader("X-Upstream-TimeMs", String(elapsedMs))
+    res.setHeader("ETag", etag)
     res.end(rewritten)
+
+    const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
+    try {
+      fs.writeFileSync(tmpFile, rewritten, "utf-8")
+      fs.renameSync(tmpFile, cacheFile)
+    } catch (e) {
+      try {
+        fs.unlinkSync(tmpFile)
+      } catch (e2) {}
+    }
   } catch (e) {
+    try {
+      const st = fs.statSync(cacheFile)
+      if (st?.size > 0) {
+        if (ifNoneMatch && ifNoneMatch === etag) {
+          res.status(304)
+          res.setHeader("ETag", etag)
+          res.end()
+          return
+        }
+        res.setHeader(
+          "Content-Type",
+          "application/vnd.apple.mpegurl; charset=utf-8",
+        )
+        res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60")
+        res.setHeader("CDN-Cache-Control", "public, max-age=60")
+        res.setHeader("ETag", etag)
+        res.setHeader("X-Video-Proxy", "globalVision")
+        res.setHeader("X-Video-Cache", "stale")
+        res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
+        fs.createReadStream(cacheFile).pipe(res)
+        return
+      }
+    } catch (e2) {}
     return fail(res, "播放代理失败", 502)
   }
 }
@@ -163,7 +242,10 @@ exports.proxySegment = async (req, res) => {
         }
 
         res.setHeader("Content-Type", guessContentType(upstreamUrl.pathname))
-        res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=2592000")
+        res.setHeader(
+          "Cache-Control",
+          "public, max-age=86400, s-maxage=2592000",
+        )
         res.setHeader("CDN-Cache-Control", "public, max-age=2592000")
         res.setHeader("ETag", etag)
         res.setHeader("X-Video-Proxy", "globalVision")
@@ -194,7 +276,8 @@ exports.proxySegment = async (req, res) => {
       return fail(res, "分片源站请求失败", 502)
     }
 
-    const contentType = upstream.headers["content-type"] || "application/octet-stream"
+    const contentType =
+      upstream.headers["content-type"] || "application/octet-stream"
     const contentLen = Number(upstream.headers["content-length"] || 0)
 
     res.status(upstream.status)
@@ -210,18 +293,33 @@ exports.proxySegment = async (req, res) => {
     res.setHeader("ETag", etag)
     res.setHeader("X-Video-Proxy", "globalVision")
     res.setHeader("X-Video-Cache", "miss")
-
-    if (!allowCache || !contentLen || contentLen > MAX_CACHE_BYTES) {
-      upstream.data.pipe(res)
-      return
-    }
+    res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
+    res.setHeader("X-Upstream-Status", String(upstream.status))
 
     const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
     const writeStream = fs.createWriteStream(tmpFile)
+    let cacheAborted = !allowCache
+    let seenBytes = 0
+
+    upstream.data.on("data", (chunk) => {
+      if (cacheAborted) return
+      seenBytes += chunk?.length || 0
+      if (seenBytes > MAX_CACHE_BYTES) {
+        cacheAborted = true
+        try {
+          writeStream.destroy()
+        } catch (e) {}
+        try {
+          fs.unlinkSync(tmpFile)
+        } catch (e) {}
+      }
+    })
+
     upstream.data.pipe(writeStream)
     upstream.data.pipe(res)
 
     writeStream.on("finish", () => {
+      if (cacheAborted) return
       try {
         fs.renameSync(tmpFile, cacheFile)
       } catch (e) {
