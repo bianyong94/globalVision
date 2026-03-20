@@ -42,7 +42,13 @@ const toSafeRating = (value) => {
 
 const buildHomeSeed = () => {
   const now = new Date()
-  return now.getFullYear() * 1000 + (now.getMonth() + 1) * 50 + now.getDate()
+  const hourBucket = Math.floor(now.getHours() / 6) // 每6小时换一轮
+  return (
+    now.getFullYear() * 10000 +
+    (now.getMonth() + 1) * 200 +
+    now.getDate() * 10 +
+    hourBucket
+  )
 }
 
 const rotateList = (arr = [], seed = 0) => {
@@ -693,17 +699,19 @@ exports.getHome = async (req, res) => {
         Video.find({
           title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i },
           category: "tv",
+          year: { $gte: 2000 },
         })
           .sort({ updatedAt: -1, vote_count: -1, rating: -1 })
-          .limit(80)
+          .limit(120)
           .select(baseSelect)
           .lean(),
         Video.find({
           title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i },
           category: "movie",
+          year: { $gte: 2000 },
         })
           .sort({ updatedAt: -1, vote_count: -1, rating: -1 })
-          .limit(80)
+          .limit(120)
           .select(baseSelect)
           .lean(),
         Video.find({
@@ -852,6 +860,34 @@ exports.getDetail = async (req, res) => {
   }
 }
 
+const normalizeSourceTitle = (raw = "") =>
+  String(raw)
+    .replace(/[《》“”"'·]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/第\s*[一二两三四五六七八九十百\d]+\s*[季部]/gi, "")
+    .replace(/Season\s*\d+/gi, "")
+    .replace(/S\d{1,2}/gi, "")
+    .trim()
+    .toLowerCase()
+
+const isStrictSourceMatch = (queryTitle = "", candidateTitle = "") => {
+  const q = normalizeSourceTitle(queryTitle)
+  const c = normalizeSourceTitle(candidateTitle)
+  if (!q || !c) return false
+  if (q === c) return true
+
+  // 只允许“同名+附加后缀”类匹配，避免命中过多包含词
+  if (c.startsWith(q)) {
+    const tail = c.slice(q.length)
+    if (!tail) return true
+    if (/^[\s:：\-—_·.()（）\[\]【】0-9一二两三四五六七八九十季部全第集完结版]+$/i.test(tail)) {
+      return true
+    }
+  }
+
+  return false
+}
+
 exports.searchSources = async (req, res) => {
   const { title } = req.query
 
@@ -881,10 +917,9 @@ exports.searchSources = async (req, res) => {
 
         // 4. 过滤与匹配逻辑
         // 资源站搜索是模糊的，我们需要过滤掉不相关的
-        const matchedItems = list.filter((item) => {
-          // 简单包含关系，忽略大小写
-          return item.vod_name.toLowerCase().includes(title.toLowerCase())
-        })
+        const matchedItems = list.filter((item) =>
+          isStrictSourceMatch(title, item?.vod_name || ""),
+        )
         const validItems = []
         for (const item of matchedItems) {
           const adult = evaluateAdultContent(item, key)
