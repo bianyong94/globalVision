@@ -683,8 +683,9 @@ exports.getHome = async (req, res) => {
         }
       })
 
+    // 首页接口不需要携带 sources（包含大量播放串），否则响应体会非常大、首屏变慢
     const baseSelect =
-      "_id title poster backdrop remarks latest_remarks year rating vote_count tags category area updatedAt sources"
+      "_id title poster backdrop remarks latest_remarks year rating vote_count tags category area updatedAt"
 
     const [heroPoolRaw, latestTvRaw, latestMovieRaw, highTvRaw, highMovieRaw] =
       await Promise.all([
