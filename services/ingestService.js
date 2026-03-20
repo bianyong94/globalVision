@@ -20,6 +20,23 @@ const toCategory = (typeName = "") => {
   return "movie"
 }
 
+const sanitizeLanguage = (value) => {
+  // 采集源语言字段格式极不稳定，出现异常时直接忽略，避免整条入库失败
+  const raw = String(value || "").trim()
+  if (!raw) return undefined
+
+  // 明显异常或过长值直接跳过
+  if (raw.length > 24) return undefined
+  if (/unsupported|override|\{|\}|\[|\]|\||\$|\n|\r/i.test(raw)) return undefined
+
+  // 常见中文/英文/日韩/多语言标记保留，其他值默认忽略
+  if (/(国语|粤语|普通话|中英|双语|英语|日语|韩语|法语|德语|西班牙语|俄语|泰语|印尼语|阿拉伯语|中文|英文|日文|韩文)/i.test(raw)) {
+    return raw.slice(0, 24)
+  }
+
+  return undefined
+}
+
 const buildSourcePayload = (item, sourceKey) => {
   return {
     source_key: sourceKey,
@@ -142,7 +159,7 @@ exports.ingestVideo = async (item, sourceKey) => {
     actors: item?.vod_actor,
     director: item?.vod_director,
     area: item?.vod_area,
-    language: item?.vod_lang,
+    language: sanitizeLanguage(item?.vod_lang),
     duration: item?.vod_duration,
     overview: item?.vod_content,
     poster: item?.vod_pic,
