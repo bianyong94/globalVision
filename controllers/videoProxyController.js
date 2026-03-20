@@ -7,7 +7,7 @@ const { getAxiosConfig } = require("../utils/httpAgent")
 const MAX_URL_LENGTH = 4000
 const HLS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const MAX_CACHE_BYTES = 25 * 1024 * 1024
-const PLAYLIST_CACHE_TTL_MS = 60 * 1000
+const PLAYLIST_CACHE_TTL_MS = 90 * 1000
 
 const fail = (res, msg = "Error", code = 500) =>
   res.status(code).json({ code, message: msg })
@@ -75,6 +75,21 @@ const guessContentType = (pathname = "") => {
   return "application/octet-stream"
 }
 
+const fetchStreamWithRetry = async (url, options = {}, retries = 1) => {
+  let lastError = null
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const response = await axios.get(url, options)
+      if (response.status >= 500 && i < retries) continue
+      return response
+    } catch (error) {
+      lastError = error
+      if (i < retries) continue
+    }
+  }
+  throw lastError || new Error("upstream fetch failed")
+}
+
 const rewriteTagUri = (line, baseUrl) => {
   const match = String(line).match(/URI="([^"]+)"/i)
   if (!match) return line
@@ -125,19 +140,23 @@ exports.proxyPlaylist = async (req, res) => {
 
   try {
     const startedAt = Date.now()
-    const upstream = await axios.get(upstreamUrl.toString(), {
-      maxRedirects: 3,
-      responseType: "text",
-      validateStatus: (status) => status >= 200 && status < 500,
-      headers: {
-        Accept:
-          "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        Referer: upstreamUrl.origin,
+    const upstream = await fetchStreamWithRetry(
+      upstreamUrl.toString(),
+      {
+        maxRedirects: 3,
+        responseType: "text",
+        validateStatus: (status) => status >= 200 && status < 500,
+        headers: {
+          Accept:
+            "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          Referer: upstreamUrl.origin,
+        },
+        ...getAxiosConfig({ timeout: 10000 }),
       },
-      ...getAxiosConfig({ timeout: 10000 }),
-    })
+      1,
+    )
 
     if (upstream.status >= 400) {
       return fail(res, "播放源站请求失败", 502)
@@ -257,20 +276,24 @@ exports.proxySegment = async (req, res) => {
   }
 
   try {
-    const upstream = await axios.get(upstreamUrl.toString(), {
-      maxRedirects: 3,
-      responseType: "stream",
-      validateStatus: (status) => status >= 200 && status < 500,
-      headers: {
-        ...(range ? { Range: range } : {}),
-        Accept: "*/*",
-        "Accept-Encoding": "identity",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        Referer: upstreamUrl.origin,
+    const upstream = await fetchStreamWithRetry(
+      upstreamUrl.toString(),
+      {
+        maxRedirects: 3,
+        responseType: "stream",
+        validateStatus: (status) => status >= 200 && status < 500,
+        headers: {
+          ...(range ? { Range: range } : {}),
+          Accept: "*/*",
+          "Accept-Encoding": "identity",
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          Referer: upstreamUrl.origin,
+        },
+        ...getAxiosConfig({ timeout: 20000 }),
       },
-      ...getAxiosConfig({ timeout: 20000 }),
-    })
+      1,
+    )
 
     if (upstream.status >= 400) {
       return fail(res, "分片源站请求失败", 502)
