@@ -354,10 +354,11 @@ const normalizeTitle = (value = "") =>
 const looksLikeDirectTitle = (text = "") => {
   const t = normalizeTitle(text)
   if (!t) return false
-  if (t.length < 2 || t.length > 40) return false
+  if (t.length < 2 || t.length > 60) return false
+  if (/《[^》]{2,50}》/.test(text)) return true
   if (isRecommendationIntent(t) || isPersonIntent(t)) return false
   if (/[#?=&/]/.test(t)) return false
-  if (/^(我要|帮我|给我|搜索|找|想看|想找|来点)/i.test(t)) return false
+  if (/^(我要|帮我|给我|搜索|找|想看|想找|来点|推荐)/i.test(t)) return false
   return true
 }
 
@@ -426,6 +427,21 @@ const splitPotentialTitles = (value = "") =>
     .split(/[，,、\n;；]/)
     .map((item) => normalizeTitle(item))
     .filter(Boolean)
+
+const extractLikelyTitleFromQuestion = (value = "") => {
+  const text = String(value || "").trim()
+  const quoted = extractQuotedTitle(text)
+  if (quoted) return normalizeTitle(quoted)
+
+  const m = text.match(/(?:找|搜|看|播放|有没有|资源|片源|影片|电影|剧集)\s*([\u4e00-\u9fa5A-Za-z0-9·\-\s]{2,40})/)
+  if (m?.[1]) return normalizeTitle(m[1])
+
+  const cleaned = normalizeTitle(text)
+    .replace(/(最新|热门|推荐|高分|想看|我要看|给我找|帮我找|全网云搜|资源)/g, "")
+    .trim()
+  if (cleaned.length >= 2 && cleaned.length <= 40) return cleaned
+  return ""
+}
 
 const looksLikeGarbage = (title = "") => {
   if (!title) return true
@@ -642,7 +658,8 @@ exports.askAI = async (req, res) => {
   const personIntent = isPersonIntent(cleanQuestion)
 
   try {
-    const titleHint = quotedTitle || (looksLikeDirectTitle(cleanQuestion) ? cleanQuestion : "")
+    const likelyTitle = extractLikelyTitleFromQuestion(cleanQuestion)
+    const titleHint = quotedTitle || (looksLikeDirectTitle(cleanQuestion) ? cleanQuestion : likelyTitle)
     const [local, tmdb, external] = await Promise.all([
       searchLocalCandidates(queryText || cleanQuestion, categoryHint),
       searchTmdbCandidates(queryText || cleanQuestion, categoryHint),
@@ -707,6 +724,10 @@ exports.askAI = async (req, res) => {
           source: "local",
         })),
       )
+    }
+    if (candidates.length === 0 && likelyTitle) {
+      const externalRetry = await searchExternalCandidates(likelyTitle)
+      candidates = dedupeCandidates([...externalRetry])
     }
     if (candidates.length === 0) return success(res, [])
 

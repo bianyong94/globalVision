@@ -86,9 +86,10 @@ const isHighQualityHomeItem = (doc = {}) => {
   return true
 }
 
-const pickUniqueFromPool = (pool, usedSet, limit, seed) => {
+const pickUniqueFromPool = (pool, usedSet, limit, seed, options = {}) => {
   const picked = []
-  for (const item of rotateList(pool, seed)) {
+  const ordered = options.keepOrder ? pool : rotateList(pool, seed)
+  for (const item of ordered) {
     const id = String(item?._id || item?.id || "")
     if (!id || usedSet.has(id)) continue
     usedSet.add(id)
@@ -746,12 +747,14 @@ exports.getHome = async (req, res) => {
       used,
       14,
       homeSeed + 11,
+      { keepOrder: true },
     )
     const latestMoviePicked = pickUniqueFromPool(
       latestMoviePool,
       used,
       14,
       homeSeed + 23,
+      { keepOrder: true },
     )
     const highTvPicked = pickUniqueFromPool(highTvPool, used, 14, homeSeed + 31)
     const highMoviePicked = pickUniqueFromPool(
@@ -922,16 +925,43 @@ exports.searchSources = async (req, res) => {
       return success(res, [])
     }
 
-    // 👇 2. 【核心新增】给全网搜索的结果也加上优先级排序逻辑
+    const normalizeSearchTitle = (raw = "") =>
+      String(raw)
+        .replace(/（.*?）|\(.*?\)/g, "")
+        .replace(/\s+/g, " ")
+        .replace(/第\s*[一二两三四五六七八九十百\d]+\s*[季部]/gi, "")
+        .replace(/Season\s*\d+/gi, "")
+        .replace(/S\d{1,2}/gi, "")
+        .trim()
+
+    const expectedBase = normalizeSearchTitle(title).toLowerCase()
+
+    // 先按剧名聚合相似度 -> 再按季数 -> 再按线路优先级
     availableSources.sort((a, b) => {
+      const titleA = String(a.title || "")
+      const titleB = String(b.title || "")
+      const baseA = normalizeSearchTitle(titleA).toLowerCase()
+      const baseB = normalizeSearchTitle(titleB).toLowerCase()
+
+      const exactA = expectedBase && baseA === expectedBase ? 0 : 1
+      const exactB = expectedBase && baseB === expectedBase ? 0 : 1
+      if (exactA !== exactB) return exactA - exactB
+
+      const containA = expectedBase && baseA.includes(expectedBase) ? 0 : 1
+      const containB = expectedBase && baseB.includes(expectedBase) ? 0 : 1
+      if (containA !== containB) return containA - containB
+
+      const seasonA = parseSeasonInfo(titleA)?.season_no ?? Number.MAX_SAFE_INTEGER
+      const seasonB = parseSeasonInfo(titleB)?.season_no ?? Number.MAX_SAFE_INTEGER
+      if (seasonA !== seasonB) return seasonA - seasonB
+
       let indexA = PRIORITY_LIST.indexOf(a.source_key)
       let indexB = PRIORITY_LIST.indexOf(b.source_key)
-
-      // 如果配置里没写的源，放到最后面 (给 999 权重)
       if (indexA === -1) indexA = 999
       if (indexB === -1) indexB = 999
+      if (indexA !== indexB) return indexA - indexB
 
-      return indexA - indexB // 升序排列，index 越小越优先
+      return titleA.localeCompare(titleB, "zh-Hans-CN")
     })
 
     // 存入缓存

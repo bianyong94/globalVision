@@ -93,6 +93,9 @@ const VideoSchema = new mongoose.Schema(
 // 列表页筛选常用组合
 VideoSchema.index({ category: 1, year: -1, rating: -1 })
 VideoSchema.index({ category: 1, tags: 1, updatedAt: -1 })
+VideoSchema.index({ category: 1, updatedAt: -1, vote_count: -1, rating: -1 })
+VideoSchema.index({ updatedAt: -1 })
+VideoSchema.index({ "sources.source_key": 1, "sources.vod_id": 1 })
 
 // 搜索优化 (支持 标题、演员、导演、原名 搜索)
 // 注意：MongoDB Text Search 对中文支持一般，建议结合 regex 使用
