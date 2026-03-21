@@ -17,6 +17,25 @@ const MAX_IMAGE_WIDTH = 2000
 const MAX_IMAGE_TRANSFORM_BYTES = 25 * 1024 * 1024
 const IMAGE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
+const fetchImageWithRetry = async (url, axiosBaseConfig = {}) => {
+  let lastError = null
+  const timeouts = [4500, 3500]
+  for (const timeout of timeouts) {
+    try {
+      const res = await axios.get(url, {
+        ...axiosBaseConfig,
+        ...getAxiosConfig({ timeout }),
+      })
+      return res
+    } catch (err) {
+      lastError = err
+      const status = err?.response?.status
+      if (status && status < 500 && status !== 429) break
+    }
+  }
+  throw lastError || new Error('image upstream failed')
+}
+
 const fail = (res, msg = "Error", code = 500) =>
   res.status(code).json({ code, message: msg })
 
@@ -130,7 +149,7 @@ exports.proxyImage = async (req, res) => {
     } catch (e) {}
 
     const startedAt = Date.now()
-    const upstream = await axios.get(parsed.toString(), {
+    const upstream = await fetchImageWithRetry(parsed.toString(), {
       responseType: "stream",
       maxRedirects: 3,
       validateStatus: (status) => status >= 200 && status < 500,
@@ -140,7 +159,6 @@ exports.proxyImage = async (req, res) => {
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: parsed.origin,
       },
-      ...getAxiosConfig({ timeout: 10000 }),
     })
 
     if (upstream.status >= 400) {
