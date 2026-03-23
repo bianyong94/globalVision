@@ -8,6 +8,14 @@ const MAX_URL_LENGTH = 4000
 const HLS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const MAX_CACHE_BYTES = 25 * 1024 * 1024
 const PLAYLIST_CACHE_TTL_MS = 90 * 1000
+const SEGMENT_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000
+const DEFAULT_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Expose-Headers":
+    "Content-Length, Content-Range, Accept-Ranges, ETag, X-Video-Proxy, X-Video-Cache, X-Upstream-Host, X-Upstream-Status, X-Upstream-TimeMs",
+  "Timing-Allow-Origin": "*",
+}
+const PREFETCH_TIMEOUT_MS = 8000
 
 const fail = (res, msg = "Error", code = 500) =>
   res.status(code).json({ code, message: msg })
@@ -77,9 +85,14 @@ const guessContentType = (pathname = "") => {
 
 const fetchStreamWithRetry = async (url, options = {}, retries = 1) => {
   let lastError = null
+  const timeouts = [8000, 12000, 18000]
   for (let i = 0; i <= retries; i++) {
     try {
-      const response = await axios.get(url, options)
+      const timeout = timeouts[Math.min(i, timeouts.length - 1)]
+      const response = await axios.get(url, {
+        ...options,
+        ...getAxiosConfig({ timeout }),
+      })
       if (response.status >= 500 && i < retries) continue
       return response
     } catch (error) {
@@ -88,6 +101,88 @@ const fetchStreamWithRetry = async (url, options = {}, retries = 1) => {
     }
   }
   throw lastError || new Error("upstream fetch failed")
+}
+
+const setDefaultProxyHeaders = (res) => {
+  for (const [key, value] of Object.entries(DEFAULT_HEADERS)) {
+    res.setHeader(key, value)
+  }
+}
+
+const serveCachedFile = (res, file, headers = {}) => {
+  setDefaultProxyHeaders(res)
+  for (const [key, value] of Object.entries(headers)) {
+    if (value !== undefined && value !== null) res.setHeader(key, value)
+  }
+  fs.createReadStream(file).pipe(res)
+}
+
+const prewarmSegmentCache = async (segmentUrl) => {
+  const upstreamUrl = parseUpstreamUrl(segmentUrl)
+  if (!upstreamUrl) return
+  const cacheDir = path.join(__dirname, "..", ".cache", "hls")
+  ensureDir(cacheDir)
+  const cacheKey = sha1(upstreamUrl.toString())
+  const cacheFile = path.join(cacheDir, `${cacheKey}.bin`)
+  try {
+    const st = fs.statSync(cacheFile)
+    if (Date.now() - st.mtimeMs < SEGMENT_CACHE_TTL_MS) return
+  } catch (e) {}
+
+  try {
+    const response = await axios.get(upstreamUrl.toString(), {
+      responseType: "stream",
+      maxRedirects: 3,
+      validateStatus: (status) => status >= 200 && status < 400,
+      headers: {
+        Accept: "*/*",
+        "Accept-Encoding": "identity",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Referer: upstreamUrl.origin,
+      },
+      ...getAxiosConfig({ timeout: PREFETCH_TIMEOUT_MS }),
+    })
+
+    const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
+    const writeStream = fs.createWriteStream(tmpFile)
+    let aborted = false
+    let seenBytes = 0
+
+    response.data.on("data", (chunk) => {
+      if (aborted) return
+      seenBytes += chunk?.length || 0
+      if (seenBytes > MAX_CACHE_BYTES) {
+        aborted = true
+        try {
+          writeStream.destroy()
+        } catch (e) {}
+        try {
+          fs.unlinkSync(tmpFile)
+        } catch (e) {}
+        try {
+          response.data.destroy()
+        } catch (e) {}
+      }
+    })
+
+    response.data.pipe(writeStream)
+    writeStream.on("finish", () => {
+      if (aborted) return
+      try {
+        fs.renameSync(tmpFile, cacheFile)
+      } catch (e) {
+        try {
+          fs.unlinkSync(tmpFile)
+        } catch (e2) {}
+      }
+    })
+    writeStream.on("error", () => {
+      try {
+        fs.unlinkSync(tmpFile)
+      } catch (e) {}
+    })
+  } catch (e) {}
 }
 
 const rewriteTagUri = (line, baseUrl) => {
@@ -123,17 +218,15 @@ exports.proxyPlaylist = async (req, res) => {
         return
       }
 
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.apple.mpegurl; charset=utf-8",
-      )
-      res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60")
-      res.setHeader("CDN-Cache-Control", "public, max-age=60")
-      res.setHeader("ETag", etag)
-      res.setHeader("X-Video-Proxy", "globalVision")
-      res.setHeader("X-Video-Cache", "hit")
-      res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
-      fs.createReadStream(cacheFile).pipe(res)
+      serveCachedFile(res, cacheFile, {
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Cache-Control": "public, max-age=10, s-maxage=60, stale-if-error=120",
+        "CDN-Cache-Control": "public, max-age=60",
+        ETag: etag,
+        "X-Video-Proxy": "globalVision",
+        "X-Video-Cache": "hit",
+        "X-Upstream-Host": upstreamUrl.hostname,
+      })
       return
     }
   } catch (e) {}
@@ -166,6 +259,7 @@ exports.proxyPlaylist = async (req, res) => {
     const baseUrl = upstreamUrl.toString()
 
     const lines = raw.split(/\r?\n/)
+    let firstPlayableUrl = ""
     const rewritten = lines
       .map((line) => {
         const l = String(line || "")
@@ -176,6 +270,7 @@ exports.proxyPlaylist = async (req, res) => {
         if (l.startsWith("#")) return l
         const resolved = resolveUri(baseUrl, l)
         if (!resolved) return l
+        if (!firstPlayableUrl) firstPlayableUrl = resolved
         return isM3u8(resolved)
           ? buildProxyPath("playlist", resolved)
           : buildProxyPath("segment", resolved)
@@ -183,11 +278,12 @@ exports.proxyPlaylist = async (req, res) => {
       .join("\n")
 
     const elapsedMs = Date.now() - startedAt
+    setDefaultProxyHeaders(res)
     res.setHeader(
       "Content-Type",
       "application/vnd.apple.mpegurl; charset=utf-8",
     )
-    res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60")
+    res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60, stale-if-error=120")
     res.setHeader("CDN-Cache-Control", "public, max-age=60")
     res.setHeader("X-Video-Proxy", "globalVision")
     res.setHeader("X-Video-Cache", "miss")
@@ -196,6 +292,12 @@ exports.proxyPlaylist = async (req, res) => {
     res.setHeader("X-Upstream-TimeMs", String(elapsedMs))
     res.setHeader("ETag", etag)
     res.end(rewritten)
+
+    if (firstPlayableUrl && !isM3u8(firstPlayableUrl)) {
+      setImmediate(() => {
+        prewarmSegmentCache(firstPlayableUrl)
+      })
+    }
 
     const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
     try {
@@ -216,17 +318,15 @@ exports.proxyPlaylist = async (req, res) => {
           res.end()
           return
         }
-        res.setHeader(
-          "Content-Type",
-          "application/vnd.apple.mpegurl; charset=utf-8",
-        )
-        res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60")
-        res.setHeader("CDN-Cache-Control", "public, max-age=60")
-        res.setHeader("ETag", etag)
-        res.setHeader("X-Video-Proxy", "globalVision")
-        res.setHeader("X-Video-Cache", "stale")
-        res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
-        fs.createReadStream(cacheFile).pipe(res)
+        serveCachedFile(res, cacheFile, {
+          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+          "Cache-Control": "public, max-age=10, s-maxage=60, stale-if-error=120",
+          "CDN-Cache-Control": "public, max-age=60",
+          ETag: etag,
+          "X-Video-Proxy": "globalVision",
+          "X-Video-Cache": "stale",
+          "X-Upstream-Host": upstreamUrl.hostname,
+        })
         return
       }
     } catch (e2) {}
@@ -250,7 +350,7 @@ exports.proxySegment = async (req, res) => {
   if (allowCache) {
     try {
       const st = fs.statSync(cacheFile)
-      const fresh = Date.now() - st.mtimeMs < HLS_CACHE_TTL_MS
+      const fresh = Date.now() - st.mtimeMs < SEGMENT_CACHE_TTL_MS
       if (fresh) {
         const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
         if (ifNoneMatch && ifNoneMatch === etag) {
@@ -260,16 +360,15 @@ exports.proxySegment = async (req, res) => {
           return
         }
 
-        res.setHeader("Content-Type", guessContentType(upstreamUrl.pathname))
-        res.setHeader(
-          "Cache-Control",
-          "public, max-age=86400, s-maxage=2592000",
-        )
-        res.setHeader("CDN-Cache-Control", "public, max-age=2592000")
-        res.setHeader("ETag", etag)
-        res.setHeader("X-Video-Proxy", "globalVision")
-        res.setHeader("X-Video-Cache", "hit")
-        fs.createReadStream(cacheFile).pipe(res)
+        serveCachedFile(res, cacheFile, {
+          "Content-Type": guessContentType(upstreamUrl.pathname),
+          "Cache-Control": "public, max-age=86400, s-maxage=2592000, stale-if-error=86400",
+          "CDN-Cache-Control": "public, max-age=2592000",
+          ETag: etag,
+          "X-Video-Proxy": "globalVision",
+          "X-Video-Cache": "hit",
+          "Accept-Ranges": "bytes",
+        })
         return
       }
     } catch (e) {}
@@ -290,7 +389,7 @@ exports.proxySegment = async (req, res) => {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
           Referer: upstreamUrl.origin,
         },
-        ...getAxiosConfig({ timeout: 20000 }),
+
       },
       1,
     )
@@ -304,14 +403,17 @@ exports.proxySegment = async (req, res) => {
     const contentLen = Number(upstream.headers["content-length"] || 0)
 
     res.status(upstream.status)
+    setDefaultProxyHeaders(res)
     if (upstream.status === 206 && upstream.headers["content-range"]) {
       res.setHeader("Content-Range", upstream.headers["content-range"])
+      res.setHeader("Accept-Ranges", "bytes")
+    } else {
       res.setHeader("Accept-Ranges", "bytes")
     }
 
     res.setHeader("Content-Type", contentType)
     if (contentLen) res.setHeader("Content-Length", String(contentLen))
-    res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=2592000")
+    res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=2592000, stale-if-error=86400")
     res.setHeader("CDN-Cache-Control", "public, max-age=2592000")
     res.setHeader("ETag", etag)
     res.setHeader("X-Video-Proxy", "globalVision")
@@ -357,6 +459,23 @@ exports.proxySegment = async (req, res) => {
       } catch (e) {}
     })
   } catch (e) {
+    if (allowCache) {
+      try {
+        const st = fs.statSync(cacheFile)
+        if (st?.size > 0) {
+          serveCachedFile(res, cacheFile, {
+            "Content-Type": guessContentType(upstreamUrl.pathname),
+            "Cache-Control": "public, max-age=60, s-maxage=86400, stale-if-error=86400",
+            "CDN-Cache-Control": "public, max-age=86400",
+            ETag: etag,
+            "X-Video-Proxy": "globalVision",
+            "X-Video-Cache": "stale",
+            "Accept-Ranges": "bytes",
+          })
+          return
+        }
+      } catch (e2) {}
+    }
     return fail(res, "分片代理失败", 502)
   }
 }
