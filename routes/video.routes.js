@@ -13,6 +13,7 @@ router.post("/download/tasks", downloadController.createTask)
 router.get("/download/tasks", downloadController.listTasks)
 router.get("/download/tasks/:id", downloadController.getTask)
 router.get("/download/file/:id", downloadController.downloadFile)
+router.get("/download/direct", downloadController.downloadDirect)
 // 详情页单独处理，因为它在原代码是 /api/detail/:id 而不是 v2
 // 但在 api.js 中我们会做统一前缀处理
 router.get("/detail/:id", controller.getDetail)

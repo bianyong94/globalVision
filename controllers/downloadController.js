@@ -202,3 +202,60 @@ exports.downloadFile = async (req, res) => {
   }
   return res.download(t.outPath, t.fileName)
 }
+
+exports.downloadDirect = async (req, res) => {
+  const url = String(req.query?.url || "").trim()
+  const title = safeName(String(req.query?.title || "video")) || "video"
+  const episode = safeName(String(req.query?.episode || ""))
+
+  if (!/^https?:\/\//i.test(url)) {
+    return res.status(400).json({ code: 400, message: "invalid url" })
+  }
+
+  const fileName = `${title}${episode ? `-${episode}` : ""}.mp4`
+
+  res.setHeader("Content-Type", "video/mp4")
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+  )
+  res.setHeader("Cache-Control", "no-store")
+  if (typeof res.flushHeaders === "function") res.flushHeaders()
+
+  const args = [
+    "-loglevel",
+    "error",
+    "-rw_timeout",
+    "15000000",
+    "-i",
+    url,
+    "-c",
+    "copy",
+    "-bsf:a",
+    "aac_adtstoasc",
+    "-movflags",
+    "frag_keyframe+empty_moov",
+    "-f",
+    "mp4",
+    "pipe:1",
+  ]
+
+  const ff = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] })
+
+  const kill = () => {
+    try {
+      ff.kill("SIGKILL")
+    } catch (e) {}
+  }
+  req.on("close", kill)
+
+  ff.stderr.on("data", () => {})
+  ff.stdout.pipe(res)
+
+  ff.on("close", (code) => {
+    req.off("close", kill)
+    if (code !== 0 && !res.headersSent) {
+      res.status(502).json({ code: 502, message: "direct download failed" })
+    }
+  })
+}
