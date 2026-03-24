@@ -5,6 +5,8 @@ const { spawn } = require("child_process")
 
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || "/opt/global-vision/downloads"
 const MAX_TASKS = Number.parseInt(process.env.DOWNLOAD_MAX_TASKS || "200", 10)
+const MAX_SECONDS = Number.parseInt(process.env.DOWNLOAD_MAX_SECONDS || "3600", 10)
+const MIN_READY_BYTES = Number.parseInt(process.env.DOWNLOAD_MIN_READY_BYTES || "5242880", 10)
 
 const tasks = new Map()
 
@@ -50,8 +52,12 @@ const runTask = (task) => {
     "-y",
     "-loglevel",
     "warning",
+    "-rw_timeout",
+    "15000000",
     "-i",
     task.url,
+    "-t",
+    String(MAX_SECONDS),
     "-c",
     "copy",
     "-bsf:a",
@@ -80,12 +86,27 @@ const runTask = (task) => {
 
   child.on("close", (code) => {
     task.pid = null
-    if (code === 0 && fs.existsSync(task.outPath)) {
+    let size = 0
+    try {
+      size = fs.statSync(task.outPath).size || 0
+    } catch (e) {}
+
+    if (code === 0 && size > 0) {
       task.status = "done"
       task.progress = 100
       task.finishedAt = Date.now()
       return
     }
+
+    // 某些源会非0退出但文件已可用，允许直接就绪
+    if (size >= MIN_READY_BYTES) {
+      task.status = "done"
+      task.progress = 100
+      task.error = `ffmpeg exit ${code}, file kept`
+      task.finishedAt = Date.now()
+      return
+    }
+
     task.status = "failed"
     task.error = `ffmpeg exit code ${code}`
     task.finishedAt = Date.now()
@@ -123,6 +144,7 @@ exports.createTask = async (req, res) => {
         status: task.status,
         progress: task.progress,
         fileName: task.fileName,
+        directUrl: `/api/v2/download/file/${task.id}`,
       },
     })
   } catch (e) {
