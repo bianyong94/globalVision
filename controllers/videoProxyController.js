@@ -17,6 +17,34 @@ const DEFAULT_HEADERS = {
 }
 const PREFETCH_TIMEOUT_MS = 8000
 
+const proxyStats = {
+  since: Date.now(),
+  playlist: { requests: 0, hit: 0, miss: 0, stale: 0, errors: 0, upstreamMsTotal: 0 },
+  segment: { requests: 0, hit: 0, miss: 0, stale: 0, errors: 0, upstreamMsTotal: 0 },
+}
+
+const markStat = (type, key, upstreamMs = 0) => {
+  const bucket = proxyStats[type]
+  if (!bucket) return
+  if (key === "requests") bucket.requests += 1
+  else if (key === "hit") bucket.hit += 1
+  else if (key === "miss") bucket.miss += 1
+  else if (key === "stale") bucket.stale += 1
+  else if (key === "errors") bucket.errors += 1
+  if (Number.isFinite(upstreamMs) && upstreamMs > 0) bucket.upstreamMsTotal += upstreamMs
+}
+
+const summarizeBucket = (bucket) => {
+  const req = bucket.requests || 0
+  const missLike = (bucket.miss || 0) + (bucket.stale || 0)
+  return {
+    ...bucket,
+    avgUpstreamMs: missLike > 0 ? Number((bucket.upstreamMsTotal / missLike).toFixed(1)) : 0,
+    hitRate: req > 0 ? Number(((bucket.hit / req) * 100).toFixed(2)) : 0,
+    errorRate: req > 0 ? Number(((bucket.errors / req) * 100).toFixed(2)) : 0,
+  }
+}
+
 const fail = (res, msg = "Error", code = 500) =>
   res.status(code).json({ code, message: msg })
 
@@ -197,6 +225,7 @@ const rewriteTagUri = (line, baseUrl) => {
 }
 
 exports.proxyPlaylist = async (req, res) => {
+  markStat("playlist", "requests")
   const upstreamUrl = parseUpstreamUrl(req.query.url)
   if (!upstreamUrl) return fail(res, "无效播放地址", 400)
 
@@ -218,6 +247,7 @@ exports.proxyPlaylist = async (req, res) => {
         return
       }
 
+      markStat("playlist", "hit")
       serveCachedFile(res, cacheFile, {
         "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
         "Cache-Control": "public, max-age=10, s-maxage=60, stale-if-error=120",
@@ -278,6 +308,7 @@ exports.proxyPlaylist = async (req, res) => {
       .join("\n")
 
     const elapsedMs = Date.now() - startedAt
+    markStat("playlist", "miss", elapsedMs)
     setDefaultProxyHeaders(res)
     res.setHeader(
       "Content-Type",
@@ -318,6 +349,7 @@ exports.proxyPlaylist = async (req, res) => {
           res.end()
           return
         }
+        markStat("playlist", "stale")
         serveCachedFile(res, cacheFile, {
           "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
           "Cache-Control": "public, max-age=10, s-maxage=60, stale-if-error=120",
@@ -330,11 +362,41 @@ exports.proxyPlaylist = async (req, res) => {
         return
       }
     } catch (e2) {}
+    markStat("playlist", "errors")
     return fail(res, "播放代理失败", 502)
   }
 }
 
+exports.getProxyStats = async (_req, res) => {
+  const uptimeSec = Math.max(1, Math.floor((Date.now() - proxyStats.since) / 1000))
+  return res.json({
+    code: 200,
+    data: {
+      since: new Date(proxyStats.since).toISOString(),
+      uptimeSec,
+      playlist: summarizeBucket(proxyStats.playlist),
+      segment: summarizeBucket(proxyStats.segment),
+    },
+  })
+}
+
+exports.resetProxyStats = async (_req, res) => {
+  proxyStats.since = Date.now()
+  for (const k of ["playlist", "segment"]) {
+    proxyStats[k] = {
+      requests: 0,
+      hit: 0,
+      miss: 0,
+      stale: 0,
+      errors: 0,
+      upstreamMsTotal: 0,
+    }
+  }
+  return res.json({ code: 200, message: "ok" })
+}
+
 exports.proxySegment = async (req, res) => {
+  markStat("segment", "requests")
   const upstreamUrl = parseUpstreamUrl(req.query.url)
   if (!upstreamUrl) return fail(res, "无效分片地址", 400)
 
@@ -360,6 +422,7 @@ exports.proxySegment = async (req, res) => {
           return
         }
 
+        markStat("segment", "hit")
         serveCachedFile(res, cacheFile, {
           "Content-Type": guessContentType(upstreamUrl.pathname),
           "Cache-Control": "public, max-age=86400, s-maxage=2592000, stale-if-error=86400",
@@ -375,6 +438,7 @@ exports.proxySegment = async (req, res) => {
   }
 
   try {
+    const startedAt = Date.now()
     const upstream = await fetchStreamWithRetry(
       upstreamUrl.toString(),
       {
@@ -402,6 +466,8 @@ exports.proxySegment = async (req, res) => {
       upstream.headers["content-type"] || "application/octet-stream"
     const contentLen = Number(upstream.headers["content-length"] || 0)
 
+    const elapsedMs = Date.now() - startedAt
+    markStat("segment", "miss", elapsedMs)
     res.status(upstream.status)
     setDefaultProxyHeaders(res)
     if (upstream.status === 206 && upstream.headers["content-range"]) {
@@ -463,6 +529,7 @@ exports.proxySegment = async (req, res) => {
       try {
         const st = fs.statSync(cacheFile)
         if (st?.size > 0) {
+          markStat("segment", "stale")
           serveCachedFile(res, cacheFile, {
             "Content-Type": guessContentType(upstreamUrl.pathname),
             "Cache-Control": "public, max-age=60, s-maxage=86400, stale-if-error=86400",
@@ -476,6 +543,7 @@ exports.proxySegment = async (req, res) => {
         }
       } catch (e2) {}
     }
+    markStat("segment", "errors")
     return fail(res, "分片代理失败", 502)
   }
 }

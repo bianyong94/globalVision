@@ -15,6 +15,8 @@ const {
 const {
   startRatingBackfillScheduler,
 } = require("./services/ratingBackfillScheduler")
+const { startPlayPrewarmScheduler } = require("./services/playPrewarmScheduler")
+const { startSourceProbeScheduler } = require("./services/sourceProbeScheduler")
 
 // const seoMiddleware = require("./middleware/seo")
 
@@ -71,6 +73,7 @@ app.use(
     origin: [
       // 1. 你的线上前端域名 (如果有的话，比如 Vercel 的地址)
       "https://www.bycurry.cc",
+      "https://bycurry.cc",
       "https://global-vision-web.vercel.app", // 举例
 
       // 2. Android App 必备 (Capacitor)
@@ -154,5 +157,7 @@ app.listen(PORT, "0.0.0.0", () => {
 
     startResourceUpdateScheduler()
     startRatingBackfillScheduler()
+    startPlayPrewarmScheduler()
+    startSourceProbeScheduler()
   }
 })
