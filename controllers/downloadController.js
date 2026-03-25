@@ -200,6 +200,10 @@ exports.downloadFile = async (req, res) => {
   if (t.status !== "done" || !fs.existsSync(t.outPath)) {
     return res.status(409).json({ code: 409, message: "file not ready" })
   }
+  try {
+    const st = fs.statSync(t.outPath)
+    if (st?.size > 0) res.setHeader("Content-Length", String(st.size))
+  } catch (e) {}
   return res.download(t.outPath, t.fileName)
 }
 
