@@ -17,6 +17,7 @@ const {
 } = require("./services/ratingBackfillScheduler")
 const { startPlayPrewarmScheduler } = require("./services/playPrewarmScheduler")
 const { startSourceProbeScheduler } = require("./services/sourceProbeScheduler")
+const { startTrendingIngestScheduler } = require("./services/trendingIngestScheduler")
 
 // const seoMiddleware = require("./middleware/seo")
 
@@ -159,5 +160,6 @@ app.listen(PORT, "0.0.0.0", () => {
     startRatingBackfillScheduler()
     startPlayPrewarmScheduler()
     startSourceProbeScheduler()
+    startTrendingIngestScheduler()
   }
 })
