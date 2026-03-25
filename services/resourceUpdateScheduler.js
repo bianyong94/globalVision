@@ -78,6 +78,7 @@ async function runForSource(sourceKey, options) {
     pages += 1
     scanned += list.length
 
+    const itemSleepMs = toInt(process.env.RESOURCE_SYNC_ITEM_SLEEP_MS, 0)
     for (const item of list) {
       if (!item?.vod_id || !item?.vod_name || !item?.vod_play_url) {
         failed += 1
@@ -93,6 +94,10 @@ async function runForSource(sourceKey, options) {
         console.error(
           `[ResourceSync] ${sourceKey} 入库失败 vod_id=${item.vod_id}: ${error.message}`,
         )
+      }
+
+      if (itemSleepMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, itemSleepMs))
       }
     }
 
