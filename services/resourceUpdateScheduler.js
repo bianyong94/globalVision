@@ -90,10 +90,19 @@ async function runForSource(sourceKey, options) {
         if (saved) ingested += 1
         else skipped += 1
       } catch (error) {
-        failed += 1
-        console.error(
-          `[ResourceSync] ${sourceKey} 入库失败 vod_id=${item.vod_id}: ${error.message}`,
-        )
+        const msg = String(error?.message || "")
+        if (/language override unsupported/i.test(msg)) {
+          // 语言字段异常属于可忽略数据问题，不算硬失败
+          skipped += 1
+          console.warn(
+            `[ResourceSync] ${sourceKey} 跳过 vod_id=${item.vod_id}: ${msg}`,
+          )
+        } else {
+          failed += 1
+          console.error(
+            `[ResourceSync] ${sourceKey} 入库失败 vod_id=${item.vod_id}: ${msg}`,
+          )
+        }
       }
 
       if (itemSleepMs > 0) {
