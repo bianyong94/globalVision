@@ -147,6 +147,98 @@ const stripSeasonSuffix = (title = "") =>
     .replace(/\s+/g, " ")
     .trim()
 
+const normalizeSearchText = (text = "") =>
+  String(text)
+    .toLowerCase()
+    .replace(/[《》“”"'·\-_:：，,\.\!！\?？\(\)\[\]\{\}]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+
+const extractSeasonNoFromText = (text = "") => {
+  const str = String(text || "")
+  let m = str.match(/第\s*([一二两三四五六七八九十百\d]+)\s*[季部]/i)
+  if (m) {
+    const n = parseChineseNumber(m[1])
+    if (n && n > 0) return n
+  }
+  m = str.match(/\bSeason\s*([0-9]{1,2})\b/i)
+  if (m) return parseInt(m[1], 10)
+  m = str.match(/\bS0*([0-9]{1,2})\b/i)
+  if (m) return parseInt(m[1], 10)
+  return null
+}
+
+const rankSearchResults = (rows = [], keyword = "") => {
+  const wdNorm = normalizeSearchText(keyword)
+  const wdBase = normalizeSearchText(stripSeasonSuffix(keyword))
+
+  const ranked = rows.map((item) => {
+    const titleNorm = normalizeSearchText(item.title || "")
+    const titleBase = normalizeSearchText(stripSeasonSuffix(item.title || ""))
+    const originalNorm = normalizeSearchText(item.original_title || "")
+    const actorsNorm = normalizeSearchText(item.actors || "")
+    const directorNorm = normalizeSearchText(item.director || "")
+    const seasonNo = extractSeasonNoFromText(item.title || "")
+
+    const exactTitle = wdNorm && titleNorm === wdNorm
+    const exactOriginal = wdNorm && originalNorm === wdNorm
+    const sameSeries = wdBase && titleBase && wdBase === titleBase
+
+    const titlePrefix = wdNorm && (titleNorm.startsWith(wdNorm) || originalNorm.startsWith(wdNorm))
+    const titleContains = wdNorm && (titleNorm.includes(wdNorm) || originalNorm.includes(wdNorm))
+    const actorHit = wdNorm && actorsNorm.includes(wdNorm)
+    const directorHit = wdNorm && directorNorm.includes(wdNorm)
+
+    let score = 0
+    if (exactTitle) score += 12000
+    if (exactOriginal) score += 10000
+    if (sameSeries) score += 9000
+    if (titlePrefix) score += 7000
+    if (titleContains) score += 4500
+    if (actorHit) score += 1800
+    if (directorHit) score += 1500
+
+    // 轻微加权，避免同分时随机
+    score += Math.min(Number(item.rating || 0) * 10, 120)
+
+    return {
+      ...item,
+      _search_rank: {
+        score,
+        seasonNo: seasonNo ?? Number.MAX_SAFE_INTEGER,
+        titleHit: Boolean(exactTitle || exactOriginal || sameSeries || titlePrefix || titleContains),
+        actorDirectorHit: Boolean(actorHit || directorHit),
+      },
+    }
+  })
+
+  const hasTitleHit = ranked.some((x) => x._search_rank?.titleHit)
+
+  ranked.sort((a, b) => {
+    const ra = a._search_rank
+    const rb = b._search_rank
+
+    if (hasTitleHit) {
+      if (ra.titleHit !== rb.titleHit) return ra.titleHit ? -1 : 1
+      if (ra.score !== rb.score) return rb.score - ra.score
+      // 同一系列时按季数升序
+      if (ra.seasonNo !== rb.seasonNo) return ra.seasonNo - rb.seasonNo
+    } else {
+      if (ra.actorDirectorHit !== rb.actorDirectorHit)
+        return ra.actorDirectorHit ? -1 : 1
+      if (ra.score !== rb.score) return rb.score - ra.score
+    }
+
+    const rateA = Number(a.rating || 0)
+    const rateB = Number(b.rating || 0)
+    if (rateA !== rateB) return rateB - rateA
+
+    return new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime()
+  })
+
+  return ranked
+}
+
 const parseSeasonInfo = (text = "") => {
   if (!text) return null
   const value = String(text)
@@ -415,6 +507,7 @@ exports.getVideos = async (req, res) => {
   try {
     const { cat, tag, area, year, sort, pg = 1, wd, view } = req.query
     const limit = 20
+    const queryLimit = wd ? 120 : limit
     const skip = (parseInt(pg) - 1) * limit
     const shouldSeasonView = view === "season" && !!wd
 
@@ -459,8 +552,6 @@ exports.getVideos = async (req, res) => {
         { actors: regex },
         { director: regex },
         { tags: regex },
-        { overview: regex },
-        { content: regex },
       ]
     }
 
@@ -570,6 +661,9 @@ exports.getVideos = async (req, res) => {
       tags: 1,
       category: 1,
       updatedAt: 1,
+      original_title: 1,
+      actors: 1,
+      director: 1,
     }
     if (shouldSeasonView) {
       projectStage.sources = 1
@@ -626,8 +720,8 @@ exports.getVideos = async (req, res) => {
     }
 
     pipeline.push({ $sort: sortStage }) // 2. 排序
-    pipeline.push({ $skip: skip }) // 3. 跳页
-    pipeline.push({ $limit: limit }) // 4. 限制数量
+    pipeline.push({ $skip: wd ? 0 : skip }) // 3. 跳页
+    pipeline.push({ $limit: queryLimit }) // 4. 限制数量
     pipeline.push({
       $project: projectStage,
     })
@@ -652,12 +746,29 @@ exports.getVideos = async (req, res) => {
       // year: item.year > new Date().getFullYear() + 1 ? 0 : item.year
     }))
 
+    if (wd) {
+      formattedList = rankSearchResults(formattedList, wd)
+      formattedList = formattedList.slice(skip, skip + limit)
+    }
+
     if (shouldSeasonView) {
       const seasonCards = list.flatMap((item) => buildSeasonCards(item))
       if (seasonCards.length > 0) {
-        formattedList = seasonCards
+        let rankedSeason = seasonCards
+        if (wd) {
+          rankedSeason = rankSearchResults(seasonCards, wd)
+          rankedSeason = rankedSeason.slice(skip, skip + limit)
+        }
+        formattedList = rankedSeason
       }
     }
+
+    formattedList = formattedList.map((item) => {
+      if (!item || !item._search_rank) return item
+      const next = { ...item }
+      delete next._search_rank
+      return next
+    })
 
     // ==========================================
     // 6. 返回结果
