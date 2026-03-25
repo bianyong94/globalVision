@@ -51,16 +51,26 @@ async function runForSource(sourceKey, options) {
   let failed = 0
   let pages = 0
 
+  let consecutivePullErrors = 0
   for (let page = 1; page <= maxPages; page += 1) {
     let list = []
     try {
       list = await fetchListByPage(sourceConfig, hours, page)
+      consecutivePullErrors = 0
     } catch (error) {
       console.error(
         `[ResourceSync] ${sourceKey} page=${page} 拉取失败: ${error.message}`,
       )
       failed += 1
-      break
+      consecutivePullErrors += 1
+      // 不中断整轮：跳过当前页继续采集；连续多页失败再停止
+      if (consecutivePullErrors >= 5) {
+        console.error(
+          `[ResourceSync] ${sourceKey} 连续 ${consecutivePullErrors} 页拉取失败，提前停止该源`,
+        )
+        break
+      }
+      continue
     }
 
     if (list.length === 0) break
