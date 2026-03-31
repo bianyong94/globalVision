@@ -515,32 +515,7 @@ exports.getVideos = async (req, res) => {
     // 1. 构建筛选条件 ($match)
     // ==========================================
     const matchStage = {}
-    const andConditions = [
-      { title: { $not: /短剧|微短剧|爽剧|爽文|赘婿|miniseries/i } },
-      {
-        title: {
-          $not: /(^|\b)(av|AV在线|成人视频|无码|有码|番号|carib|heyzo|fc2|pornhub|xvideos|国产自拍|偷拍|偷拍自拍|换妻|自拍偷拍|做爱实录)(\b|$)/i,
-        },
-      },
-      {
-        $or: [
-          { tags: { $exists: false } },
-          {
-            tags: {
-              $nin: [
-                "短剧",
-                "微短剧",
-                "爽剧",
-                "爽文",
-                "miniseries",
-                "成人",
-                "AV",
-              ],
-            },
-          },
-        ],
-      },
-    ]
+    const andConditions = []
 
     // 🔍 关键词搜索
     if (wd) {
