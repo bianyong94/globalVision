@@ -97,6 +97,10 @@ VideoSchema.index({ category: 1, updatedAt: -1, vote_count: -1, rating: -1 })
 VideoSchema.index({ updatedAt: -1 })
 VideoSchema.index({ "sources.source_key": 1, "sources.vod_id": 1 })
 
+// 🔥🔥🔥 新增：拯救详情页和历史记录的 8 秒慢查询的救命索引！
+VideoSchema.index({ "sources.vod_id": 1 }) // 让单独查 vod_id 也能走索引
+VideoSchema.index({ uniq_id: 1 }) // 兼容旧版历史记录的查询
+
 // 🔥 新增：专门为了解决列表页按“地区”、“年份”筛选组合时导致的 10 秒慢查询
 VideoSchema.index({ category: 1, area: 1, updatedAt: -1 })
 VideoSchema.index({ category: 1, year: -1, updatedAt: -1 })
