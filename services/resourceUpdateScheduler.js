@@ -92,12 +92,26 @@ async function runForSource(sourceKey, options) {
       } catch (error) {
         const msg = String(error?.message || "")
         if (/language override unsupported/i.test(msg)) {
-          // 语言字段异常属于可忽略数据问题，不算硬失败
-          skipped += 1
+          // 💡 修复逻辑：仅仅因为语言格式不对就跳过整部剧太亏了。
+          // 这里强制清空有问题的语言字段，并进行二次入库尝试！
           console.warn(
-            `[ResourceSync] ${sourceKey} 跳过 vod_id=${item.vod_id}: ${msg}`,
+            `[ResourceSync] 语言异常，正在清空语言并重试 vod_id=${item.vod_id}`,
           )
+          item.vod_lang = "" // 清空引发崩溃的罪魁祸首字段
+
+          try {
+            const retrySaved = await ingestVideo(item, sourceKey)
+            if (retrySaved) {
+              ingested += 1 // 重试成功，算作正常入库
+            } else {
+              skipped += 1
+            }
+          } catch (retryError) {
+            // 如果清空语言后依然报错，那只能无可奈何地跳过了
+            skipped += 1
+          }
         } else {
+          // 其他非语言类的严重报错，正常计入 failed
           failed += 1
           console.error(
             `[ResourceSync] ${sourceKey} 入库失败 vod_id=${item.vod_id}: ${msg}`,

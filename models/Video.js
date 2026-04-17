@@ -83,7 +83,7 @@ const VideoSchema = new mongoose.Schema(
   {
     timestamps: true, // 自动维护 createdAt, updatedAt
     minimize: false, // 防止空对象被忽略
-  }
+  },
 )
 
 // ==========================================
@@ -97,6 +97,12 @@ VideoSchema.index({ category: 1, updatedAt: -1, vote_count: -1, rating: -1 })
 VideoSchema.index({ updatedAt: -1 })
 VideoSchema.index({ "sources.source_key": 1, "sources.vod_id": 1 })
 
+// 🔥 新增：专门为了解决列表页按“地区”、“年份”筛选组合时导致的 10 秒慢查询
+VideoSchema.index({ category: 1, area: 1, updatedAt: -1 })
+VideoSchema.index({ category: 1, year: -1, updatedAt: -1 })
+VideoSchema.index({ area: 1, updatedAt: -1 })
+VideoSchema.index({ year: -1, updatedAt: -1 })
+
 // 搜索优化 (支持 标题、演员、导演、原名 搜索)
 // 注意：MongoDB Text Search 对中文支持一般，建议结合 regex 使用
 VideoSchema.index(
@@ -108,7 +114,7 @@ VideoSchema.index(
   },
   {
     weights: { title: 10, original_title: 5, actors: 3, director: 1 },
-  }
+  },
 )
 
 module.exports = mongoose.model("Video", VideoSchema)

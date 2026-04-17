@@ -15,9 +15,10 @@ const {
 const {
   startRatingBackfillScheduler,
 } = require("./services/ratingBackfillScheduler")
-const { startPlayPrewarmScheduler } = require("./services/playPrewarmScheduler")
 const { startSourceProbeScheduler } = require("./services/sourceProbeScheduler")
-const { startTrendingIngestScheduler } = require("./services/trendingIngestScheduler")
+const {
+  startTrendingIngestScheduler,
+} = require("./services/trendingIngestScheduler")
 
 // const seoMiddleware = require("./middleware/seo")
 
@@ -54,9 +55,13 @@ app.use((req, res, next) => {
 
   res.on("finish", () => {
     const p = `${req.baseUrl || ""}${req.path || ""}`
-    if (p.startsWith("/api/video/proxy") || p.startsWith("/api/image/proxy")) return
+    if (p.startsWith("/api/video/proxy") || p.startsWith("/api/image/proxy"))
+      return
     const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6
-    const slowMs = Number.parseInt(String(process.env.SLOW_REQUEST_MS || "1200"), 10)
+    const slowMs = Number.parseInt(
+      String(process.env.SLOW_REQUEST_MS || "1200"),
+      10,
+    )
     const threshold = Number.isFinite(slowMs) && slowMs > 0 ? slowMs : 1200
     if (elapsedMs >= threshold) {
       console.warn(
@@ -128,7 +133,8 @@ app.use(
 // 全局 API 限流
 app.use("/api", (req, res, next) => {
   const p = String(req.path || "")
-  if (p.startsWith("/image/proxy") || p.startsWith("/video/proxy")) return next()
+  if (p.startsWith("/image/proxy") || p.startsWith("/video/proxy"))
+    return next()
   return apiLimiter(req, res, next)
 })
 
@@ -158,7 +164,6 @@ app.listen(PORT, "0.0.0.0", () => {
 
     startResourceUpdateScheduler()
     startRatingBackfillScheduler()
-    startPlayPrewarmScheduler()
     startSourceProbeScheduler()
     startTrendingIngestScheduler()
   }
