@@ -19,8 +19,22 @@ const PREFETCH_TIMEOUT_MS = 8000
 
 const proxyStats = {
   since: Date.now(),
-  playlist: { requests: 0, hit: 0, miss: 0, stale: 0, errors: 0, upstreamMsTotal: 0 },
-  segment: { requests: 0, hit: 0, miss: 0, stale: 0, errors: 0, upstreamMsTotal: 0 },
+  playlist: {
+    requests: 0,
+    hit: 0,
+    miss: 0,
+    stale: 0,
+    errors: 0,
+    upstreamMsTotal: 0,
+  },
+  segment: {
+    requests: 0,
+    hit: 0,
+    miss: 0,
+    stale: 0,
+    errors: 0,
+    upstreamMsTotal: 0,
+  },
 }
 
 const markStat = (type, key, upstreamMs = 0) => {
@@ -31,7 +45,8 @@ const markStat = (type, key, upstreamMs = 0) => {
   else if (key === "miss") bucket.miss += 1
   else if (key === "stale") bucket.stale += 1
   else if (key === "errors") bucket.errors += 1
-  if (Number.isFinite(upstreamMs) && upstreamMs > 0) bucket.upstreamMsTotal += upstreamMs
+  if (Number.isFinite(upstreamMs) && upstreamMs > 0)
+    bucket.upstreamMsTotal += upstreamMs
 }
 
 const summarizeBucket = (bucket) => {
@@ -39,7 +54,8 @@ const summarizeBucket = (bucket) => {
   const missLike = (bucket.miss || 0) + (bucket.stale || 0)
   return {
     ...bucket,
-    avgUpstreamMs: missLike > 0 ? Number((bucket.upstreamMsTotal / missLike).toFixed(1)) : 0,
+    avgUpstreamMs:
+      missLike > 0 ? Number((bucket.upstreamMsTotal / missLike).toFixed(1)) : 0,
     hitRate: req > 0 ? Number(((bucket.hit / req) * 100).toFixed(2)) : 0,
     errorRate: req > 0 ? Number(((bucket.errors / req) * 100).toFixed(2)) : 0,
   }
@@ -294,16 +310,21 @@ exports.proxyPlaylist = async (req, res) => {
       .map((line) => {
         const l = String(line || "")
         if (!l) return l
+
+        // 关键点1：解密密钥 (Key) 通常受严格跨域限制且文件极小，保留走代理
         if (l.startsWith("#EXT-X-KEY") || l.startsWith("#EXT-X-MAP")) {
           return rewriteTagUri(l, baseUrl)
         }
+
         if (l.startsWith("#")) return l
         const resolved = resolveUri(baseUrl, l)
         if (!resolved) return l
         if (!firstPlayableUrl) firstPlayableUrl = resolved
+
+        // 关键点2：子 m3u8 继续代理，如果是 ts/m4s 分片，直接返回真实绝对地址直连源站！
         return isM3u8(resolved)
           ? buildProxyPath("playlist", resolved)
-          : buildProxyPath("segment", resolved)
+          : resolved
       })
       .join("\n")
 
@@ -314,7 +335,10 @@ exports.proxyPlaylist = async (req, res) => {
       "Content-Type",
       "application/vnd.apple.mpegurl; charset=utf-8",
     )
-    res.setHeader("Cache-Control", "public, max-age=10, s-maxage=60, stale-if-error=120")
+    res.setHeader(
+      "Cache-Control",
+      "public, max-age=10, s-maxage=60, stale-if-error=120",
+    )
     res.setHeader("CDN-Cache-Control", "public, max-age=60")
     res.setHeader("X-Video-Proxy", "globalVision")
     res.setHeader("X-Video-Cache", "miss")
@@ -324,11 +348,11 @@ exports.proxyPlaylist = async (req, res) => {
     res.setHeader("ETag", etag)
     res.end(rewritten)
 
-    if (firstPlayableUrl && !isM3u8(firstPlayableUrl)) {
-      setImmediate(() => {
-        prewarmSegmentCache(firstPlayableUrl)
-      })
-    }
+    // if (firstPlayableUrl && !isM3u8(firstPlayableUrl)) {
+    //   setImmediate(() => {
+    //     prewarmSegmentCache(firstPlayableUrl)
+    //   })
+    // }
 
     const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
     try {
@@ -352,7 +376,8 @@ exports.proxyPlaylist = async (req, res) => {
         markStat("playlist", "stale")
         serveCachedFile(res, cacheFile, {
           "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-          "Cache-Control": "public, max-age=10, s-maxage=60, stale-if-error=120",
+          "Cache-Control":
+            "public, max-age=10, s-maxage=60, stale-if-error=120",
           "CDN-Cache-Control": "public, max-age=60",
           ETag: etag,
           "X-Video-Proxy": "globalVision",
@@ -368,7 +393,10 @@ exports.proxyPlaylist = async (req, res) => {
 }
 
 exports.getProxyStats = async (_req, res) => {
-  const uptimeSec = Math.max(1, Math.floor((Date.now() - proxyStats.since) / 1000))
+  const uptimeSec = Math.max(
+    1,
+    Math.floor((Date.now() - proxyStats.since) / 1000),
+  )
   return res.json({
     code: 200,
     data: {
@@ -395,47 +423,169 @@ exports.resetProxyStats = async (_req, res) => {
   return res.json({ code: 200, message: "ok" })
 }
 
+// exports.proxySegment = async (req, res) => {
+//   markStat("segment", "requests")
+//   const upstreamUrl = parseUpstreamUrl(req.query.url)
+//   if (!upstreamUrl) return fail(res, "无效分片地址", 400)
+
+//   const range = String(req.headers.range || "").trim()
+//   const cacheDir = path.join(__dirname, "..", ".cache", "hls")
+//   ensureDir(cacheDir)
+//   const cacheKey = sha1(upstreamUrl.toString())
+//   const cacheFile = path.join(cacheDir, `${cacheKey}.bin`)
+//   const etag = `"${cacheKey}"`
+
+//   const allowCache = !range
+
+//   if (allowCache) {
+//     try {
+//       const st = fs.statSync(cacheFile)
+//       const fresh = Date.now() - st.mtimeMs < SEGMENT_CACHE_TTL_MS
+//       if (fresh) {
+//         const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
+//         if (ifNoneMatch && ifNoneMatch === etag) {
+//           res.status(304)
+//           res.setHeader("ETag", etag)
+//           res.end()
+//           return
+//         }
+
+//         markStat("segment", "hit")
+//         serveCachedFile(res, cacheFile, {
+//           "Content-Type": guessContentType(upstreamUrl.pathname),
+//           "Cache-Control":
+//             "public, max-age=86400, s-maxage=2592000, stale-if-error=86400",
+//           "CDN-Cache-Control": "public, max-age=2592000",
+//           ETag: etag,
+//           "X-Video-Proxy": "globalVision",
+//           "X-Video-Cache": "hit",
+//           "Accept-Ranges": "bytes",
+//         })
+//         return
+//       }
+//     } catch (e) {}
+//   }
+
+//   try {
+//     const startedAt = Date.now()
+//     const upstream = await fetchStreamWithRetry(
+//       upstreamUrl.toString(),
+//       {
+//         maxRedirects: 3,
+//         responseType: "stream",
+//         validateStatus: (status) => status >= 200 && status < 500,
+//         headers: {
+//           ...(range ? { Range: range } : {}),
+//           Accept: "*/*",
+//           "Accept-Encoding": "identity",
+//           "User-Agent":
+//             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+//           Referer: upstreamUrl.origin,
+//         },
+//       },
+//       1,
+//     )
+
+//     if (upstream.status >= 400) {
+//       return fail(res, "分片源站请求失败", 502)
+//     }
+
+//     const contentType =
+//       upstream.headers["content-type"] || "application/octet-stream"
+//     const contentLen = Number(upstream.headers["content-length"] || 0)
+
+//     const elapsedMs = Date.now() - startedAt
+//     markStat("segment", "miss", elapsedMs)
+//     res.status(upstream.status)
+//     setDefaultProxyHeaders(res)
+//     if (upstream.status === 206 && upstream.headers["content-range"]) {
+//       res.setHeader("Content-Range", upstream.headers["content-range"])
+//       res.setHeader("Accept-Ranges", "bytes")
+//     } else {
+//       res.setHeader("Accept-Ranges", "bytes")
+//     }
+
+//     res.setHeader("Content-Type", contentType)
+//     if (contentLen) res.setHeader("Content-Length", String(contentLen))
+//     res.setHeader(
+//       "Cache-Control",
+//       "public, max-age=86400, s-maxage=2592000, stale-if-error=86400",
+//     )
+//     res.setHeader("CDN-Cache-Control", "public, max-age=2592000")
+//     res.setHeader("ETag", etag)
+//     res.setHeader("X-Video-Proxy", "globalVision")
+//     res.setHeader("X-Video-Cache", "miss")
+//     res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
+//     res.setHeader("X-Upstream-Status", String(upstream.status))
+
+//     const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
+//     const writeStream = fs.createWriteStream(tmpFile)
+//     let cacheAborted = !allowCache
+//     let seenBytes = 0
+
+//     upstream.data.on("data", (chunk) => {
+//       if (cacheAborted) return
+//       seenBytes += chunk?.length || 0
+//       if (seenBytes > MAX_CACHE_BYTES) {
+//         cacheAborted = true
+//         try {
+//           writeStream.destroy()
+//         } catch (e) {}
+//         try {
+//           fs.unlinkSync(tmpFile)
+//         } catch (e) {}
+//       }
+//     })
+
+//     upstream.data.pipe(writeStream)
+//     upstream.data.pipe(res)
+
+//     writeStream.on("finish", () => {
+//       if (cacheAborted) return
+//       try {
+//         fs.renameSync(tmpFile, cacheFile)
+//       } catch (e) {
+//         try {
+//           fs.unlinkSync(tmpFile)
+//         } catch (e2) {}
+//       }
+//     })
+//     writeStream.on("error", () => {
+//       try {
+//         fs.unlinkSync(tmpFile)
+//       } catch (e) {}
+//     })
+//   } catch (e) {
+//     if (allowCache) {
+//       try {
+//         const st = fs.statSync(cacheFile)
+//         if (st?.size > 0) {
+//           markStat("segment", "stale")
+//           serveCachedFile(res, cacheFile, {
+//             "Content-Type": guessContentType(upstreamUrl.pathname),
+//             "Cache-Control":
+//               "public, max-age=60, s-maxage=86400, stale-if-error=86400",
+//             "CDN-Cache-Control": "public, max-age=86400",
+//             ETag: etag,
+//             "X-Video-Proxy": "globalVision",
+//             "X-Video-Cache": "stale",
+//             "Accept-Ranges": "bytes",
+//           })
+//           return
+//         }
+//       } catch (e2) {}
+//     }
+//     markStat("segment", "errors")
+//     return fail(res, "分片代理失败", 502)
+//   }
+// }
+
 exports.proxySegment = async (req, res) => {
   markStat("segment", "requests")
   const upstreamUrl = parseUpstreamUrl(req.query.url)
   if (!upstreamUrl) return fail(res, "无效分片地址", 400)
 
   const range = String(req.headers.range || "").trim()
-  const cacheDir = path.join(__dirname, "..", ".cache", "hls")
-  ensureDir(cacheDir)
-  const cacheKey = sha1(upstreamUrl.toString())
-  const cacheFile = path.join(cacheDir, `${cacheKey}.bin`)
-  const etag = `"${cacheKey}"`
-
-  const allowCache = !range
-
-  if (allowCache) {
-    try {
-      const st = fs.statSync(cacheFile)
-      const fresh = Date.now() - st.mtimeMs < SEGMENT_CACHE_TTL_MS
-      if (fresh) {
-        const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
-        if (ifNoneMatch && ifNoneMatch === etag) {
-          res.status(304)
-          res.setHeader("ETag", etag)
-          res.end()
-          return
-        }
-
-        markStat("segment", "hit")
-        serveCachedFile(res, cacheFile, {
-          "Content-Type": guessContentType(upstreamUrl.pathname),
-          "Cache-Control": "public, max-age=86400, s-maxage=2592000, stale-if-error=86400",
-          "CDN-Cache-Control": "public, max-age=2592000",
-          ETag: etag,
-          "X-Video-Proxy": "globalVision",
-          "X-Video-Cache": "hit",
-          "Accept-Ranges": "bytes",
-        })
-        return
-      }
-    } catch (e) {}
-  }
 
   try {
     const startedAt = Date.now()
@@ -453,7 +603,6 @@ exports.proxySegment = async (req, res) => {
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
           Referer: upstreamUrl.origin,
         },
-
       },
       1,
     )
@@ -462,14 +611,12 @@ exports.proxySegment = async (req, res) => {
       return fail(res, "分片源站请求失败", 502)
     }
 
-    const contentType =
-      upstream.headers["content-type"] || "application/octet-stream"
-    const contentLen = Number(upstream.headers["content-length"] || 0)
-
     const elapsedMs = Date.now() - startedAt
     markStat("segment", "miss", elapsedMs)
+
     res.status(upstream.status)
     setDefaultProxyHeaders(res)
+
     if (upstream.status === 206 && upstream.headers["content-range"]) {
       res.setHeader("Content-Range", upstream.headers["content-range"])
       res.setHeader("Accept-Ranges", "bytes")
@@ -477,72 +624,24 @@ exports.proxySegment = async (req, res) => {
       res.setHeader("Accept-Ranges", "bytes")
     }
 
+    const contentType =
+      upstream.headers["content-type"] || "application/octet-stream"
+    const contentLen = Number(upstream.headers["content-length"] || 0)
+
     res.setHeader("Content-Type", contentType)
     if (contentLen) res.setHeader("Content-Length", String(contentLen))
-    res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=2592000, stale-if-error=86400")
-    res.setHeader("CDN-Cache-Control", "public, max-age=2592000")
-    res.setHeader("ETag", etag)
-    res.setHeader("X-Video-Proxy", "globalVision")
-    res.setHeader("X-Video-Cache", "miss")
-    res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
-    res.setHeader("X-Upstream-Status", String(upstream.status))
 
-    const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
-    const writeStream = fs.createWriteStream(tmpFile)
-    let cacheAborted = !allowCache
-    let seenBytes = 0
+    // 增加对 Cloudflare 的缓存指示，让 CDN 帮你扛流量
+    res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=2592000")
 
-    upstream.data.on("data", (chunk) => {
-      if (cacheAborted) return
-      seenBytes += chunk?.length || 0
-      if (seenBytes > MAX_CACHE_BYTES) {
-        cacheAborted = true
-        try {
-          writeStream.destroy()
-        } catch (e) {}
-        try {
-          fs.unlinkSync(tmpFile)
-        } catch (e) {}
-      }
-    })
-
-    upstream.data.pipe(writeStream)
+    // 🔥 彻底抛弃 fs 读写，使用纯内存管道透传数据流给前端
     upstream.data.pipe(res)
 
-    writeStream.on("finish", () => {
-      if (cacheAborted) return
-      try {
-        fs.renameSync(tmpFile, cacheFile)
-      } catch (e) {
-        try {
-          fs.unlinkSync(tmpFile)
-        } catch (e2) {}
-      }
-    })
-    writeStream.on("error", () => {
-      try {
-        fs.unlinkSync(tmpFile)
-      } catch (e) {}
+    upstream.data.on("error", (err) => {
+      console.error("分片流透传中断:", err.message)
+      if (!res.headersSent) res.end()
     })
   } catch (e) {
-    if (allowCache) {
-      try {
-        const st = fs.statSync(cacheFile)
-        if (st?.size > 0) {
-          markStat("segment", "stale")
-          serveCachedFile(res, cacheFile, {
-            "Content-Type": guessContentType(upstreamUrl.pathname),
-            "Cache-Control": "public, max-age=60, s-maxage=86400, stale-if-error=86400",
-            "CDN-Cache-Control": "public, max-age=86400",
-            ETag: etag,
-            "X-Video-Proxy": "globalVision",
-            "X-Video-Cache": "stale",
-            "Accept-Ranges": "bytes",
-          })
-          return
-        }
-      } catch (e2) {}
-    }
     markStat("segment", "errors")
     return fail(res, "分片代理失败", 502)
   }
