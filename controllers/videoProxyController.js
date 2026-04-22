@@ -63,6 +63,11 @@ const summarizeBucket = (bucket) => {
 
 const fail = (res, msg = "Error", code = 500) =>
   res.status(code).json({ code, message: msg })
+const failWithDetail = (res, msg = "Error", code = 500, detail = "") => {
+  const payload = { code, message: msg }
+  if (detail) payload.detail = String(detail)
+  return res.status(code).json(payload)
+}
 
 const isPrivateHostname = (hostname) => {
   if (!hostname) return true
@@ -111,9 +116,40 @@ const resolveUri = (baseUrl, uri) => {
 
 const isM3u8 = (u) => /\.m3u8(\?.*)?$/i.test(String(u || ""))
 
-const buildProxyPath = (type, upstream) => {
+const normalizeRefererMode = (input) => {
+  const mode = String(input || "").trim().toLowerCase()
+  if (["none", "omit", "no-referrer", "noreferrer"].includes(mode))
+    return "none"
+  return "origin"
+}
+
+const parseProxyFlags = (req) => {
+  const proxySegmentsRaw = String(
+    req?.query?.proxy_segments ?? req?.query?.proxySegments ?? "",
+  )
+    .trim()
+    .toLowerCase()
+  const proxySegments = ["1", "true", "yes", "on"].includes(proxySegmentsRaw)
+  const refererMode = normalizeRefererMode(req?.query?.referer ?? req?.query?.ref)
+  return { proxySegments, refererMode }
+}
+
+const makeUpstreamHeaders = (upstreamUrl, refererMode = "origin", extra = {}) => ({
+  ...extra,
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  ...(refererMode === "none" ? {} : { Referer: upstreamUrl.origin }),
+})
+
+const buildProxyPath = (type, upstream, flags = {}) => {
   const suffix = type === "playlist" ? "playlist.m3u8" : "segment"
-  return `/api/video/proxy/${suffix}?url=${encodeURIComponent(upstream)}`
+  const params = new URLSearchParams()
+  params.set("url", upstream)
+  if (flags?.proxySegments) params.set("proxy_segments", "1")
+  if (flags?.refererMode && flags.refererMode !== "origin") {
+    params.set("ref", flags.refererMode)
+  }
+  return `/api/video/proxy/${suffix}?${params.toString()}`
 }
 
 const guessContentType = (pathname = "") => {
@@ -161,7 +197,7 @@ const serveCachedFile = (res, file, headers = {}) => {
   fs.createReadStream(file).pipe(res)
 }
 
-const prewarmSegmentCache = async (segmentUrl) => {
+const prewarmSegmentCache = async (segmentUrl, refererMode = "origin") => {
   const upstreamUrl = parseUpstreamUrl(segmentUrl)
   if (!upstreamUrl) return
   const cacheDir = path.join(__dirname, "..", ".cache", "hls")
@@ -178,13 +214,10 @@ const prewarmSegmentCache = async (segmentUrl) => {
       responseType: "stream",
       maxRedirects: 3,
       validateStatus: (status) => status >= 200 && status < 400,
-      headers: {
+      headers: makeUpstreamHeaders(upstreamUrl, refererMode, {
         Accept: "*/*",
         "Accept-Encoding": "identity",
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        Referer: upstreamUrl.origin,
-      },
+      }),
       ...getAxiosConfig({ timeout: PREFETCH_TIMEOUT_MS }),
     })
 
@@ -229,14 +262,14 @@ const prewarmSegmentCache = async (segmentUrl) => {
   } catch (e) {}
 }
 
-const rewriteTagUri = (line, baseUrl) => {
+const rewriteTagUri = (line, baseUrl, flags = {}) => {
   const match = String(line).match(/URI="([^"]+)"/i)
   if (!match) return line
   const resolved = resolveUri(baseUrl, match[1])
   if (!resolved) return line
   const proxied = isM3u8(resolved)
-    ? buildProxyPath("playlist", resolved)
-    : buildProxyPath("segment", resolved)
+    ? buildProxyPath("playlist", resolved, flags)
+    : buildProxyPath("segment", resolved, flags)
   return line.replace(/URI="([^"]+)"/i, `URI="${proxied}"`)
 }
 
@@ -244,6 +277,7 @@ exports.proxyPlaylist = async (req, res) => {
   markStat("playlist", "requests")
   const upstreamUrl = parseUpstreamUrl(req.query.url)
   if (!upstreamUrl) return fail(res, "无效播放地址", 400)
+  const flags = parseProxyFlags(req)
 
   const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
   const cacheDir = path.join(__dirname, "..", ".cache", "hls-playlist")
@@ -288,9 +322,7 @@ exports.proxyPlaylist = async (req, res) => {
         headers: {
           Accept:
             "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Referer: upstreamUrl.origin,
+          ...makeUpstreamHeaders(upstreamUrl, flags.refererMode),
         },
         ...getAxiosConfig({ timeout: 10000 }),
       },
@@ -298,7 +330,13 @@ exports.proxyPlaylist = async (req, res) => {
     )
 
     if (upstream.status >= 400) {
-      return fail(res, "播放源站请求失败", 502)
+      const host = upstreamUrl.hostname
+      return failWithDetail(
+        res,
+        `播放源站请求失败(${upstream.status})`,
+        502,
+        `host=${host}`,
+      )
     }
 
     const raw = String(upstream.data || "")
@@ -313,7 +351,7 @@ exports.proxyPlaylist = async (req, res) => {
 
         // 关键点1：解密密钥 (Key) 通常受严格跨域限制且文件极小，保留走代理
         if (l.startsWith("#EXT-X-KEY") || l.startsWith("#EXT-X-MAP")) {
-          return rewriteTagUri(l, baseUrl)
+          return rewriteTagUri(l, baseUrl, flags)
         }
 
         if (l.startsWith("#")) return l
@@ -322,8 +360,11 @@ exports.proxyPlaylist = async (req, res) => {
         if (!firstPlayableUrl) firstPlayableUrl = resolved
 
         // 关键点2：子 m3u8 继续代理，如果是 ts/m4s 分片，直接返回真实绝对地址直连源站！
-        return isM3u8(resolved)
-          ? buildProxyPath("playlist", resolved)
+        if (isM3u8(resolved)) return buildProxyPath("playlist", resolved, flags)
+        const forceProxySegment =
+          flags.proxySegments || upstreamUrl.protocol === "http:"
+        return forceProxySegment
+          ? buildProxyPath("segment", resolved, flags)
           : resolved
       })
       .join("\n")
@@ -388,7 +429,23 @@ exports.proxyPlaylist = async (req, res) => {
       }
     } catch (e2) {}
     markStat("playlist", "errors")
-    return fail(res, "播放代理失败", 502)
+    const host = upstreamUrl.hostname
+    const errCode = String(e?.code || "")
+    const detail = `${errCode || "UNKNOWN"} ${e?.message || ""}`.trim()
+    const likelyIpv6RouteIssue =
+      host.includes(":") &&
+      ["ENETUNREACH", "EHOSTUNREACH", "ETIMEDOUT", "ENOTFOUND"].includes(
+        errCode,
+      )
+    if (likelyIpv6RouteIssue) {
+      return failWithDetail(
+        res,
+        "播放代理失败：服务器无法访问该IPv6源",
+        502,
+        detail,
+      )
+    }
+    return failWithDetail(res, "播放代理失败", 502, detail)
   }
 }
 
@@ -584,6 +641,7 @@ exports.proxySegment = async (req, res) => {
   markStat("segment", "requests")
   const upstreamUrl = parseUpstreamUrl(req.query.url)
   if (!upstreamUrl) return fail(res, "无效分片地址", 400)
+  const flags = parseProxyFlags(req)
 
   const range = String(req.headers.range || "").trim()
 
@@ -597,18 +655,23 @@ exports.proxySegment = async (req, res) => {
         validateStatus: (status) => status >= 200 && status < 500,
         headers: {
           ...(range ? { Range: range } : {}),
-          Accept: "*/*",
-          "Accept-Encoding": "identity",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Referer: upstreamUrl.origin,
+          ...makeUpstreamHeaders(upstreamUrl, flags.refererMode, {
+            Accept: "*/*",
+            "Accept-Encoding": "identity",
+          }),
         },
       },
       1,
     )
 
     if (upstream.status >= 400) {
-      return fail(res, "分片源站请求失败", 502)
+      const host = upstreamUrl.hostname
+      return failWithDetail(
+        res,
+        `分片源站请求失败(${upstream.status})`,
+        502,
+        `host=${host}`,
+      )
     }
 
     const elapsedMs = Date.now() - startedAt
@@ -643,6 +706,22 @@ exports.proxySegment = async (req, res) => {
     })
   } catch (e) {
     markStat("segment", "errors")
-    return fail(res, "分片代理失败", 502)
+    const host = upstreamUrl.hostname
+    const errCode = String(e?.code || "")
+    const detail = `${errCode || "UNKNOWN"} ${e?.message || ""}`.trim()
+    const likelyIpv6RouteIssue =
+      host.includes(":") &&
+      ["ENETUNREACH", "EHOSTUNREACH", "ETIMEDOUT", "ENOTFOUND"].includes(
+        errCode,
+      )
+    if (likelyIpv6RouteIssue) {
+      return failWithDetail(
+        res,
+        "分片代理失败：服务器无法访问该IPv6源",
+        502,
+        detail,
+      )
+    }
+    return failWithDetail(res, "分片代理失败", 502, detail)
   }
 }

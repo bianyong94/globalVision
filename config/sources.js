@@ -45,15 +45,7 @@ module.exports = {
   CATEGORY_RELATIONS,
 
   // 优先级列表 (搜索排序用)
-  PRIORITY_LIST: [
-    "feifan",
-    "liangzi",
-    "jszy",
-    "guangsu",
-    "wujin",
-    "maotai",
-    "hongniu",
-  ],
+  PRIORITY_LIST: ["feifan", "liangzi", "jszy", "guangsu", "maotai", "hongniu"],
 
   sources: {
     // ===========================
@@ -100,13 +92,6 @@ module.exports = {
     guangsu: {
       name: "光速资源",
       url: "https://api.guangsuapi.com/api.php/provide/vod/from/gsm3u8/",
-      id_map: MAP_STANDARD,
-      home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
-    },
-    // ♾️ 无尽资源
-    wujin: {
-      name: "无尽资源",
-      url: "https://api.wjcjapi.com/api.php/provide/vod/from/wjm3u8/",
       id_map: MAP_STANDARD,
       home_map: { movie_hot: 1, tv_cn: 13, anime: 4 },
     },
