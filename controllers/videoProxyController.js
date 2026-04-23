@@ -1,4 +1,6 @@
 const axios = require("axios")
+const http = require("http")
+const https = require("https")
 const crypto = require("crypto")
 const fs = require("fs")
 const path = require("path")
@@ -9,6 +11,8 @@ const HLS_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const MAX_CACHE_BYTES = 25 * 1024 * 1024
 const PLAYLIST_CACHE_TTL_MS = 90 * 1000
 const SEGMENT_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000
+const LIVE_SITE_REFERER = "https://kq8svip-iqy.92kq.cn/classify/live?type=2"
+const LIVE_SITE_ORIGIN = "https://kq8svip-iqy.92kq.cn"
 const DEFAULT_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Expose-Headers":
@@ -16,6 +20,11 @@ const DEFAULT_HEADERS = {
   "Timing-Allow-Origin": "*",
 }
 const PREFETCH_TIMEOUT_MS = 8000
+const noKeepAliveHttpAgent = new http.Agent({ keepAlive: false })
+const noKeepAliveHttpsAgent = new https.Agent({
+  keepAlive: false,
+  rejectUnauthorized: false,
+})
 
 const proxyStats = {
   since: Date.now(),
@@ -89,6 +98,26 @@ const ensureDir = (dirPath) => {
 const sha1 = (text) =>
   crypto.createHash("sha1").update(String(text)).digest("hex")
 
+const extractUpstreamCandidates = (raw) => {
+  const input = String(raw || "").trim()
+  if (!input) return []
+  const normalized = input.replace(/\r?\n/g, "#")
+  const chunks = normalized
+    .split("#")
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const out = []
+  for (const chunk of chunks) {
+    if (/^https?:\/\//i.test(chunk)) {
+      out.push(chunk)
+      continue
+    }
+    const m = chunk.match(/https?:\/\/[^\s]+/gi)
+    if (m?.length) out.push(...m)
+  }
+  return Array.from(new Set(out))
+}
+
 const parseUpstreamUrl = (raw) => {
   const url = String(raw || "").trim()
   if (!url) return null
@@ -102,6 +131,51 @@ const parseUpstreamUrl = (raw) => {
   if (!["http:", "https:"].includes(parsed.protocol)) return null
   if (isPrivateHostname(parsed.hostname)) return null
   return parsed
+}
+
+const pickReachablePlaylist = async (req, headersBase, flags) => {
+  const candidates = extractUpstreamCandidates(req.query.url)
+  const parsed = candidates
+    .map((c) => parseUpstreamUrl(c))
+    .filter(Boolean)
+  if (!parsed.length) return { upstreamUrl: null, upstream: null, lastError: null }
+
+  let lastError = null
+  const profiles = [
+    { refererMode: flags.refererMode, noKeepAlive: false },
+    { refererMode: "none", noKeepAlive: true },
+    { refererMode: "origin", noKeepAlive: true },
+  ]
+
+  for (const upstreamUrl of parsed) {
+    for (const profile of profiles) {
+      try {
+        const common = getAxiosConfig({ timeout: 10000 })
+        const upstream = await fetchStreamWithRetry(
+          upstreamUrl.toString(),
+          {
+            maxRedirects: 3,
+            responseType: "text",
+            validateStatus: (status) => status >= 200 && status < 500,
+            headers: headersBase(upstreamUrl, profile),
+            ...common,
+            ...(profile.noKeepAlive
+              ? {
+                  httpAgent: noKeepAliveHttpAgent,
+                  httpsAgent: noKeepAliveHttpsAgent,
+                }
+              : {}),
+          },
+          2,
+        )
+        if (upstream.status < 400) return { upstreamUrl, upstream, lastError: null }
+        lastError = new Error(`HTTP_${upstream.status}`)
+      } catch (e) {
+        lastError = e
+      }
+    }
+  }
+  return { upstreamUrl: parsed[0], upstream: null, lastError }
 }
 
 const resolveUri = (baseUrl, uri) => {
@@ -120,6 +194,7 @@ const normalizeRefererMode = (input) => {
   const mode = String(input || "").trim().toLowerCase()
   if (["none", "omit", "no-referrer", "noreferrer"].includes(mode))
     return "none"
+  if (["site", "page", "source"].includes(mode)) return "site"
   return "origin"
 }
 
@@ -131,14 +206,25 @@ const parseProxyFlags = (req) => {
     .toLowerCase()
   const proxySegments = ["1", "true", "yes", "on"].includes(proxySegmentsRaw)
   const refererMode = normalizeRefererMode(req?.query?.referer ?? req?.query?.ref)
-  return { proxySegments, refererMode }
+  const liveRaw = String(req?.query?.live ?? "")
+    .trim()
+    .toLowerCase()
+  const live = ["1", "true", "yes", "on"].includes(liveRaw)
+  return { proxySegments, refererMode, live }
 }
 
 const makeUpstreamHeaders = (upstreamUrl, refererMode = "origin", extra = {}) => ({
   ...extra,
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  ...(refererMode === "none" ? {} : { Referer: upstreamUrl.origin }),
+  ...(refererMode === "none"
+    ? {}
+    : refererMode === "site"
+      ? {
+          Referer: LIVE_SITE_REFERER,
+          Origin: LIVE_SITE_ORIGIN,
+        }
+      : { Referer: upstreamUrl.origin }),
 })
 
 const buildProxyPath = (type, upstream, flags = {}) => {
@@ -149,6 +235,7 @@ const buildProxyPath = (type, upstream, flags = {}) => {
   if (flags?.refererMode && flags.refererMode !== "origin") {
     params.set("ref", flags.refererMode)
   }
+  if (flags?.live) params.set("live", "1")
   return `/api/video/proxy/${suffix}?${params.toString()}`
 }
 
@@ -275,9 +362,11 @@ const rewriteTagUri = (line, baseUrl, flags = {}) => {
 
 exports.proxyPlaylist = async (req, res) => {
   markStat("playlist", "requests")
-  const upstreamUrl = parseUpstreamUrl(req.query.url)
+  const firstCandidate = extractUpstreamCandidates(req.query.url)[0] || req.query.url
+  const upstreamUrl = parseUpstreamUrl(firstCandidate)
   if (!upstreamUrl) return fail(res, "无效播放地址", 400)
   const flags = parseProxyFlags(req)
+  const shouldUseCache = !flags.live
 
   const ifNoneMatch = String(req.headers["if-none-match"] || "").trim()
   const cacheDir = path.join(__dirname, "..", ".cache", "hls-playlist")
@@ -286,51 +375,63 @@ exports.proxyPlaylist = async (req, res) => {
   const cacheFile = path.join(cacheDir, `${cacheKey}.m3u8`)
   const etag = `"${cacheKey}"`
 
-  try {
-    const st = fs.statSync(cacheFile)
-    const fresh = Date.now() - st.mtimeMs < PLAYLIST_CACHE_TTL_MS
-    if (fresh) {
-      if (ifNoneMatch && ifNoneMatch === etag) {
-        res.status(304)
-        res.setHeader("ETag", etag)
-        res.end()
+  if (shouldUseCache) {
+    try {
+      const st = fs.statSync(cacheFile)
+      const fresh = Date.now() - st.mtimeMs < PLAYLIST_CACHE_TTL_MS
+      if (fresh) {
+        if (ifNoneMatch && ifNoneMatch === etag) {
+          res.status(304)
+          res.setHeader("ETag", etag)
+          res.end()
+          return
+        }
+
+        markStat("playlist", "hit")
+        serveCachedFile(res, cacheFile, {
+          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+          "Cache-Control": "public, max-age=10, s-maxage=60, stale-if-error=120",
+          "CDN-Cache-Control": "public, max-age=60",
+          ETag: etag,
+          "X-Video-Proxy": "globalVision",
+          "X-Video-Cache": "hit",
+          "X-Upstream-Host": upstreamUrl.hostname,
+        })
         return
       }
-
-      markStat("playlist", "hit")
-      serveCachedFile(res, cacheFile, {
-        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-        "Cache-Control": "public, max-age=10, s-maxage=60, stale-if-error=120",
-        "CDN-Cache-Control": "public, max-age=60",
-        ETag: etag,
-        "X-Video-Proxy": "globalVision",
-        "X-Video-Cache": "hit",
-        "X-Upstream-Host": upstreamUrl.hostname,
-      })
-      return
-    }
-  } catch (e) {}
+    } catch (e) {}
+  }
 
   try {
     const startedAt = Date.now()
-    const upstream = await fetchStreamWithRetry(
-      upstreamUrl.toString(),
-      {
-        maxRedirects: 3,
-        responseType: "text",
-        validateStatus: (status) => status >= 200 && status < 500,
-        headers: {
-          Accept:
-            "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
-          ...makeUpstreamHeaders(upstreamUrl, flags.refererMode),
-        },
-        ...getAxiosConfig({ timeout: 10000 }),
-      },
-      1,
+    const picked = await pickReachablePlaylist(
+      req,
+      (u, profile) => ({
+        Accept:
+          "application/vnd.apple.mpegurl,application/x-mpegURL,text/plain,*/*",
+        "Accept-Encoding": "identity",
+        Connection: profile?.noKeepAlive ? "close" : "keep-alive",
+        ...makeUpstreamHeaders(
+          u,
+          profile?.refererMode || flags.refererMode || "origin",
+        ),
+      }),
+      flags,
     )
+    const activeUpstreamUrl = picked.upstreamUrl || upstreamUrl
+    const upstream = picked.upstream
+
+    if (!upstream) {
+      const detail = String(
+        picked.lastError?.code ||
+          picked.lastError?.message ||
+          `host=${activeUpstreamUrl.hostname}`,
+      )
+      return failWithDetail(res, "播放代理失败", 502, detail)
+    }
 
     if (upstream.status >= 400) {
-      const host = upstreamUrl.hostname
+      const host = activeUpstreamUrl.hostname
       return failWithDetail(
         res,
         `播放源站请求失败(${upstream.status})`,
@@ -339,9 +440,8 @@ exports.proxyPlaylist = async (req, res) => {
       )
     }
 
+    const baseUrl = activeUpstreamUrl.toString()
     const raw = String(upstream.data || "")
-    const baseUrl = upstreamUrl.toString()
-
     const lines = raw.split(/\r?\n/)
     let firstPlayableUrl = ""
     const rewritten = lines
@@ -362,7 +462,7 @@ exports.proxyPlaylist = async (req, res) => {
         // 关键点2：子 m3u8 继续代理，如果是 ts/m4s 分片，直接返回真实绝对地址直连源站！
         if (isM3u8(resolved)) return buildProxyPath("playlist", resolved, flags)
         const forceProxySegment =
-          flags.proxySegments || upstreamUrl.protocol === "http:"
+          flags.proxySegments || activeUpstreamUrl.protocol === "http:"
         return forceProxySegment
           ? buildProxyPath("segment", resolved, flags)
           : resolved
@@ -376,14 +476,21 @@ exports.proxyPlaylist = async (req, res) => {
       "Content-Type",
       "application/vnd.apple.mpegurl; charset=utf-8",
     )
-    res.setHeader(
-      "Cache-Control",
-      "public, max-age=10, s-maxage=60, stale-if-error=120",
-    )
-    res.setHeader("CDN-Cache-Control", "public, max-age=60")
+    if (shouldUseCache) {
+      res.setHeader(
+        "Cache-Control",
+        "public, max-age=10, s-maxage=60, stale-if-error=120",
+      )
+      res.setHeader("CDN-Cache-Control", "public, max-age=60")
+    } else {
+      res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+      res.setHeader("Pragma", "no-cache")
+      res.setHeader("Expires", "0")
+      res.setHeader("CDN-Cache-Control", "no-store")
+    }
     res.setHeader("X-Video-Proxy", "globalVision")
     res.setHeader("X-Video-Cache", "miss")
-    res.setHeader("X-Upstream-Host", upstreamUrl.hostname)
+    res.setHeader("X-Upstream-Host", activeUpstreamUrl.hostname)
     res.setHeader("X-Upstream-Status", String(upstream.status))
     res.setHeader("X-Upstream-TimeMs", String(elapsedMs))
     res.setHeader("ETag", etag)
@@ -395,39 +502,43 @@ exports.proxyPlaylist = async (req, res) => {
     //   })
     // }
 
-    const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
-    try {
-      fs.writeFileSync(tmpFile, rewritten, "utf-8")
-      fs.renameSync(tmpFile, cacheFile)
-    } catch (e) {
+    if (shouldUseCache) {
+      const tmpFile = `${cacheFile}.${process.pid}.${Date.now()}.tmp`
       try {
-        fs.unlinkSync(tmpFile)
-      } catch (e2) {}
+        fs.writeFileSync(tmpFile, rewritten, "utf-8")
+        fs.renameSync(tmpFile, cacheFile)
+      } catch (e) {
+        try {
+          fs.unlinkSync(tmpFile)
+        } catch (e2) {}
+      }
     }
   } catch (e) {
-    try {
-      const st = fs.statSync(cacheFile)
-      if (st?.size > 0) {
-        if (ifNoneMatch && ifNoneMatch === etag) {
-          res.status(304)
-          res.setHeader("ETag", etag)
-          res.end()
+    if (shouldUseCache) {
+      try {
+        const st = fs.statSync(cacheFile)
+        if (st?.size > 0) {
+          if (ifNoneMatch && ifNoneMatch === etag) {
+            res.status(304)
+            res.setHeader("ETag", etag)
+            res.end()
+            return
+          }
+          markStat("playlist", "stale")
+          serveCachedFile(res, cacheFile, {
+            "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+            "Cache-Control":
+              "public, max-age=10, s-maxage=60, stale-if-error=120",
+            "CDN-Cache-Control": "public, max-age=60",
+            ETag: etag,
+            "X-Video-Proxy": "globalVision",
+            "X-Video-Cache": "stale",
+            "X-Upstream-Host": upstreamUrl.hostname,
+          })
           return
         }
-        markStat("playlist", "stale")
-        serveCachedFile(res, cacheFile, {
-          "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-          "Cache-Control":
-            "public, max-age=10, s-maxage=60, stale-if-error=120",
-          "CDN-Cache-Control": "public, max-age=60",
-          ETag: etag,
-          "X-Video-Proxy": "globalVision",
-          "X-Video-Cache": "stale",
-          "X-Upstream-Host": upstreamUrl.hostname,
-        })
-        return
-      }
-    } catch (e2) {}
+      } catch (e2) {}
+    }
     markStat("playlist", "errors")
     const host = upstreamUrl.hostname
     const errCode = String(e?.code || "")

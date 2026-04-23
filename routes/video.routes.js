@@ -1,6 +1,7 @@
 const express = require("express")
 const router = express.Router()
 const controller = require("../controllers/videoController")
+const liveController = require("../controllers/liveController")
 const downloadController = require("../controllers/downloadController")
 
 router.get("/videos", controller.getVideos)
@@ -17,5 +18,8 @@ router.get("/download/direct", downloadController.downloadDirect)
 // 详情页单独处理，因为它在原代码是 /api/detail/:id 而不是 v2
 // 但在 api.js 中我们会做统一前缀处理
 router.get("/detail/:id", controller.getDetail)
+router.get("/live/basketball", liveController.getBasketballLiveList)
+router.get("/live/basketball/page", liveController.getBasketballLivePageData)
+router.get("/live/real", liveController.getRealLives)
 
 module.exports = router
