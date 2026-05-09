@@ -2,38 +2,33 @@ const axios = require("axios")
 const { getAxiosConfig } = require("../utils/httpAgent")
 const { getCache, setCache } = require("../utils/cache")
 
-const LIVE_API_BASE = "https://zhiboapi3003.zb6.fun/webapi/live/getListByCategory"
-const LIVE_PAGE_API_BASE = "https://zhiboapi3003.zb6.fun/webapi/live/getLivePageData"
-const REAL_LIVES_API_BASE = "https://zhiboapi3003.zb6.fun/api/live/getRealLives"
-const LIVE_SITE_ORIGIN = "https://kq8svip-iqy.92kq.cn"
-const LIVE_SITE_REFERER = "https://kq8svip-iqy.92kq.cn/"
-const LIVE_CACHE_TTL_SEC = 20
-const LIVE_PAGE_CACHE_TTL_SEC = 15
+const LIVE_API_HOSTS = [
+  "https://zhiboapi1001.bszb.me",
+  "https://zhiboapi3003.zb6.fun",
+]
+const LIVE_SITE_ORIGIN = "https://svipkanqiu8-qq.92kq.cn"
+const LIVE_SITE_REFERER = "https://svipkanqiu8-qq.92kq.cn/classify/live?type=2"
+const LIVE_CACHE_TTL_SEC = 15
 
 const buildUserAgent = () =>
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 const isReplayHint = (text = "") =>
-  /回放|录像|录播|重播|重播中|replay|vod/i.test(String(text || ""))
+  /回放|录像|录播|重播|replay|vod|playlist_eof/i.test(String(text || ""))
 
 const inferLiveState = (item = {}) => {
   const status = Number(item.status || 0)
   const endStamp = item.end_stamp ? Number(item.end_stamp) : 0
   const startStamp = item.start_stamp ? Number(item.start_stamp) : 0
   const now = Math.floor(Date.now() / 1000)
-  const titleText = [
-    item.title,
-    item.badge_text,
-    item.anchor?.nick_name,
-    item.anchor?.name,
-  ]
+  const merged = [item.title, item.badge_text, item.anchor?.nick_name]
     .filter(Boolean)
     .join(" ")
 
   if (endStamp > 0) return "ended"
-  if (isReplayHint(titleText)) return "replay"
+  if (isReplayHint(merged)) return "replay"
   if (status === 1) {
-    if (startStamp > 0 && now - startStamp > 24 * 3600) return "unknown"
+    if (startStamp > 0 && now - startStamp > 36 * 3600) return "unknown"
     return "live"
   }
   return "unknown"
@@ -42,17 +37,12 @@ const inferLiveState = (item = {}) => {
 const normalizeItem = (item = {}) => {
   const pullUrl = String(item.pull_url || item.stream || "").trim()
   const liveState = inferLiveState(item)
-  const title = String(item.title || item.anchor?.nick_name || "未命名直播").trim()
-  const badgeText = String(item.badge_text || "").trim()
-  const anchorName = String(item.anchor?.nick_name || "").trim()
-  const isLiveGuess = liveState === "live"
-
   return {
-    id: String(item.liveid || item.id || item.anchorid || title),
+    id: String(item.liveid || item.id || item.anchorid || item.title || Date.now()),
     liveid: item.liveid || item.id || null,
-    title,
-    badge_text: badgeText,
-    anchor_name: anchorName,
+    title: String(item.title || item.anchor?.nick_name || "未命名直播"),
+    badge_text: String(item.badge_text || ""),
+    anchor_name: String(item.anchor?.nick_name || ""),
     anchorid: item.anchorid || null,
     thumb: item.thumb || item.mask_thumb || "",
     pull_url: pullUrl,
@@ -71,263 +61,239 @@ const normalizeItem = (item = {}) => {
     sp_ids: item.sp_ids || "",
     sp_source: item.sp_source || "",
     live_state: liveState,
-    is_live_guess: isLiveGuess,
-    source_label: liveState === "live" ? "直播中" : liveState === "replay" ? "回放疑似" : "待确认",
+    is_live_guess: liveState === "live",
+    source_label:
+      liveState === "live"
+        ? "直播中"
+        : liveState === "replay"
+          ? "回放疑似"
+          : "待确认",
   }
 }
 
-const fetchLiveListByCategory = async (params = {}) => {
-  const response = await axios.post(LIVE_API_BASE, params, {
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      "Content-Type": "application/json",
-      "User-Agent": buildUserAgent(),
-      Referer: LIVE_SITE_REFERER,
-      Origin: LIVE_SITE_ORIGIN,
-    },
-    ...getAxiosConfig({ timeout: 10000 }),
-  })
+const normalizeCategory = (raw = {}) => ({
+  id: Number(raw.id || 0),
+  title: String(raw.title || ""),
+  icon: String(raw.icon || ""),
+  sort: Number(raw.sort || 0),
+  status: Number(raw.status || 0),
+})
 
-  if (response.status >= 400) {
-    const err = new Error(`HTTP_${response.status}`)
-    err.code = `HTTP_${response.status}`
-    throw err
-  }
+const getLiveHeaders = () => ({
+  Accept: "application/json, text/plain, */*",
+  "Content-Type": "application/json",
+  "User-Agent": buildUserAgent(),
+  Referer: LIVE_SITE_REFERER,
+  Origin: LIVE_SITE_ORIGIN,
+})
 
-  return response.data
-}
-
-const fetchUpstreamLiveJson = async (url, params = {}, referer = "https://zhiboapi3003.zb6.fun/") => {
-  const response = await axios.post(url, params, {
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      "Content-Type": "application/json",
-      "User-Agent": buildUserAgent(),
-      Referer: referer,
-      Origin: LIVE_SITE_ORIGIN,
-    },
-    ...getAxiosConfig({ timeout: 10000 }),
-  })
-
-  if (response.status >= 400) {
-    const err = new Error(`HTTP_${response.status}`)
-    err.code = `HTTP_${response.status}`
-    throw err
-  }
-
-  return response.data
-}
-
-exports.getBasketballLiveList = async (req, res) => {
-  try {
-    const categoryid = String(req.query.categoryid || "2")
-    const page = String(req.query.page || "1")
-    const platform = String(req.query.platform || "0")
-    const size = String(req.query.size || "20")
-    const sp_source = String(req.query.sp_source || "1102")
-
-    const cacheKey = [
-      "live:basketball",
-      categoryid,
-      page,
-      platform,
-      size,
-      sp_source,
-    ].join(":")
-
-    const cached = await getCache(cacheKey)
-    if (cached) {
-      return res.json({ code: 200, data: cached, cached: true })
+const postLiveWithFallback = async (pathname, payload = {}, timeout = 10000) => {
+  let lastError = null
+  for (const host of LIVE_API_HOSTS) {
+    try {
+      const response = await axios.post(`${host}${pathname}`, payload, {
+        headers: getLiveHeaders(),
+        ...getAxiosConfig({ timeout }),
+      })
+      if (response.status >= 400) throw new Error(`HTTP_${response.status}`)
+      const data = response.data || {}
+      if (Number(data.status) !== 0 && data.status !== undefined) {
+        const msg = data?.message || data?.msg || `APP_STATUS_${data.status}`
+        const err = new Error(msg)
+        err.code = `APP_STATUS_${data.status}`
+        throw err
+      }
+      return { host, data }
+    } catch (error) {
+      lastError = error
     }
+  }
+  throw lastError || new Error("UPSTREAM_FAILED")
+}
 
-    const upstream = await fetchLiveListByCategory({
-      categoryid,
-      page,
-      platform,
-      size,
-      sp_source,
+const selectListFromPayload = (upstreamData) => {
+  const data = upstreamData?.data
+  if (Array.isArray(data)) return data
+  if (Array.isArray(data?.list)) return data.list
+  if (Array.isArray(data?.data)) return data.data
+  if (Array.isArray(upstreamData?.list)) return upstreamData.list
+  return []
+}
+
+exports.getLiveCategories = async (req, res) => {
+  try {
+    const cacheKey = "live:categories:v2"
+    const cached = await getCache(cacheKey)
+    if (cached) return res.json({ code: 200, data: cached, cached: true })
+
+    const { host, data } = await postLiveWithFallback("/webapi/live/getCategory", {})
+    const categories = selectListFromPayload(data)
+      .map(normalizeCategory)
+      .filter((x) => x.id > 0 && x.status === 1)
+      .sort((a, b) => a.sort - b.sort)
+
+    const payload = { source: host, total: categories.length, items: categories }
+    await setCache(cacheKey, payload, LIVE_CACHE_TTL_SEC)
+    return res.json({ code: 200, data: payload })
+  } catch (error) {
+    return res.status(502).json({
+      code: 502,
+      message: "获取直播分类失败",
+      detail: String(error?.code || error?.message || "UNKNOWN"),
     })
+  }
+}
 
-    const sourceData = upstream?.data || upstream?.list || upstream?.result || []
-    const list = Array.isArray(sourceData)
-      ? sourceData
-      : Array.isArray(sourceData?.list)
-        ? sourceData.list
-        : Array.isArray(sourceData?.data)
-          ? sourceData.data
-          : []
+exports.getLiveListByCategory = async (req, res) => {
+  try {
+    const categoryid = Number(req.query.categoryid || 2)
+    const page = Number(req.query.page || 1)
+    const size = Number(req.query.size || 20)
+    const platform = Number(req.query.platform || 0)
+    const sp_source = String(req.query.sp_source || "1102")
+    const params = { categoryid, page, size, platform, sp_source }
+    const cacheKey = `live:list:${categoryid}:${page}:${size}:${platform}:${sp_source}`
+    const cached = await getCache(cacheKey)
+    if (cached) return res.json({ code: 200, data: cached, cached: true })
+
+    const { host, data } = await postLiveWithFallback(
+      "/webapi/live/getListByCategory",
+      params,
+    )
+    const list = selectListFromPayload(data)
+    const count = Number(data?.data?.count || list.length || 0)
+    const filterCount = Number(data?.data?.filter_count || 0)
 
     const items = list
       .map(normalizeItem)
-      .filter((item) => item.pull_url)
+      .filter((x) => x.pull_url)
       .sort((a, b) => {
-        const stateScore = (x) =>
+        const lv = (x) =>
           x.live_state === "live" ? 3000 : x.live_state === "replay" ? 2000 : 1000
-        if (stateScore(b) !== stateScore(a)) return stateScore(b) - stateScore(a)
-        if (b.hot !== a.hot) return b.hot - a.hot
+        if (lv(a) !== lv(b)) return lv(b) - lv(a)
+        if (a.hot !== b.hot) return b.hot - a.hot
         return Number(b.start_stamp || 0) - Number(a.start_stamp || 0)
       })
 
     const payload = {
-      source: "zhiboapi3003.zb6.fun",
-      categoryid: Number(categoryid),
-      page: Number(page),
-      platform: Number(platform),
-      size: Number(size),
+      source: host,
+      categoryid,
+      page,
+      size,
+      platform,
       sp_source,
       total: items.length,
-      liveCount: items.filter((item) => item.live_state === "live").length,
-      replayCount: items.filter((item) => item.live_state === "replay").length,
+      count,
+      filter_count: filterCount,
+      liveCount: items.filter((x) => x.live_state === "live").length,
+      replayCount: items.filter((x) => x.live_state === "replay").length,
       items,
-      raw: {
-        code: upstream?.code ?? null,
-        message: upstream?.message ?? null,
-      },
     }
-
     await setCache(cacheKey, payload, LIVE_CACHE_TTL_SEC)
     return res.json({ code: 200, data: payload })
   } catch (error) {
-    const detail = String(error?.code || error?.message || "UNKNOWN")
     return res.status(502).json({
       code: 502,
-      message: "获取篮球直播列表失败",
-      detail,
+      message: "获取分类直播列表失败",
+      detail: String(error?.code || error?.message || "UNKNOWN"),
     })
   }
 }
 
-exports.getBasketballLivePageData = async (req, res) => {
+exports.getLivePageData = async (req, res) => {
   try {
-    const anchorid = String(req.query.anchorid || "")
-    if (!anchorid) {
-      return res.status(400).json({ code: 400, message: "anchorid required" })
-    }
+    const anchorid = String(req.query.anchorid || "").trim()
+    if (!anchorid) return res.status(400).json({ code: 400, message: "anchorid required" })
 
     const params = {
-      anchorid,
-      check_sum:
-        String(req.query.check_sum || "ef94edc2918f67a19ffe3447b7c65720").trim(),
-      platform: String(req.query.platform || "0"),
-      platform_check: String(req.query.platform_check || "0"),
+      anchorid: Number(anchorid),
+      platform_check: Number(req.query.platform_check || 0),
+      platform: Number(req.query.platform || 0),
       sp_source: String(req.query.sp_source || "1102"),
-      userid: String(
-        req.query.userid || `guest${Date.now()}${Math.floor(Math.random() * 1000)}`,
-      ),
+      check_sum: String(req.query.check_sum || "").trim() || undefined,
+      userid:
+        String(req.query.userid || "").trim() ||
+        `guest${Date.now()}${Math.floor(Math.random() * 1000)}`,
     }
-
-    const cacheKey = [
-      "live:page",
-      params.anchorid,
-      params.check_sum,
-      params.platform,
-      params.platform_check,
-      params.sp_source,
-      params.userid,
-    ].join(":")
-
+    if (!params.check_sum) delete params.check_sum
+    const cacheKey = `live:page:${params.anchorid}:${params.platform}:${params.platform_check}:${params.sp_source}`
     const cached = await getCache(cacheKey)
-    if (cached) {
-      return res.json({ code: 200, data: cached, cached: true })
-    }
+    if (cached) return res.json({ code: 200, data: cached, cached: true })
 
-    const upstream = await fetchUpstreamLiveJson(LIVE_PAGE_API_BASE, params, LIVE_SITE_REFERER)
-    const data = upstream?.data || upstream || {}
-    const live = data?.live || {}
-    const pullUrl = String(live.pull_url || data.pull_url || "").trim()
-    const item = normalizeItem({
-      ...live,
-      title: live.title || data.title,
-      anchor: data.anchor || live.anchor,
-      pull_url: pullUrl,
-      thumb: live.thumb || data.thumb || "",
+    const { host, data } = await postLiveWithFallback(
+      "/webapi/live/getLivePageData",
+      params,
+    )
+    const liveRaw = data?.data?.live || {}
+    const live = normalizeItem({
+      ...liveRaw,
+      anchor: data?.data?.anchor || liveRaw?.anchor,
     })
 
     const payload = {
-      source: "zhiboapi3003.zb6.fun",
+      source: host,
       params,
-      live: item,
-      live_state: item.live_state,
-      pull_url: pullUrl,
-      streams: Array.isArray(live.pull_url_multiple_new)
-        ? live.pull_url_multiple_new
+      live,
+      pull_url: live.pull_url,
+      streams: Array.isArray(liveRaw?.pull_url_multiple_new)
+        ? liveRaw.pull_url_multiple_new
         : [],
-      raw: {
-        code: upstream?.code ?? null,
-        message: upstream?.message ?? null,
-      },
+      room: data?.data || {},
     }
-
-    await setCache(cacheKey, payload, LIVE_PAGE_CACHE_TTL_SEC)
+    await setCache(cacheKey, payload, 10)
     return res.json({ code: 200, data: payload })
   } catch (error) {
-    const detail = String(error?.code || error?.message || "UNKNOWN")
     return res.status(502).json({
       code: 502,
       message: "获取直播详情失败",
-      detail,
+      detail: String(error?.code || error?.message || "UNKNOWN"),
     })
   }
 }
 
 exports.getRealLives = async (req, res) => {
   try {
-    const page = String(req.query.page || "1")
-    const platform = String(req.query.platform || "0")
-    const size = String(req.query.size || "12")
+    const page = Number(req.query.page || 1)
+    const size = Number(req.query.size || 12)
+    const platform = Number(req.query.platform || 0)
     const sp_source = String(req.query.sp_source || "1102")
-
-    const cacheKey = ["live:real", page, platform, size, sp_source].join(":")
+    const params = { page, size, platform, sp_source }
+    const cacheKey = `live:real:${page}:${size}:${platform}:${sp_source}`
     const cached = await getCache(cacheKey)
-    if (cached) {
-      return res.json({ code: 200, data: cached, cached: true })
-    }
+    if (cached) return res.json({ code: 200, data: cached, cached: true })
 
-    const upstream = await fetchUpstreamLiveJson(REAL_LIVES_API_BASE, {
-      page,
-      platform,
-      size,
-      sp_source,
-    }, LIVE_SITE_REFERER)
-
-    const sourceData = upstream?.list || upstream?.data || upstream?.result || []
-    const list = Array.isArray(sourceData)
-      ? sourceData
-      : Array.isArray(sourceData?.list)
-        ? sourceData.list
-        : Array.isArray(sourceData?.data)
-          ? sourceData.data
-          : []
+    const { host, data } = await postLiveWithFallback("/api/live/getRealLives", params)
+    const list = selectListFromPayload(data)
+    const count = Number(data?.data?.count || list.length || 0)
 
     const items = list
       .map(normalizeItem)
-      .filter((item) => item.pull_url)
+      .filter((x) => x.pull_url)
       .sort((a, b) => Number(b.hot || 0) - Number(a.hot || 0))
 
     const payload = {
-      source: "zhiboapi3003.zb6.fun",
-      page: Number(page),
-      platform: Number(platform),
-      size: Number(size),
+      source: host,
+      categoryid: 0,
+      page,
+      size,
+      platform,
       sp_source,
       total: items.length,
-      liveCount: items.filter((item) => item.live_state === "live").length,
-      replayCount: items.filter((item) => item.live_state === "replay").length,
+      count,
+      liveCount: items.filter((x) => x.live_state === "live").length,
+      replayCount: items.filter((x) => x.live_state === "replay").length,
       items,
-      raw: {
-        code: upstream?.code ?? null,
-        message: upstream?.message ?? null,
-      },
     }
-
     await setCache(cacheKey, payload, LIVE_CACHE_TTL_SEC)
     return res.json({ code: 200, data: payload })
   } catch (error) {
-    const detail = String(error?.code || error?.message || "UNKNOWN")
     return res.status(502).json({
       code: 502,
       message: "获取实时直播列表失败",
-      detail,
+      detail: String(error?.code || error?.message || "UNKNOWN"),
     })
   }
 }
+
+exports.getBasketballLiveList = exports.getLiveListByCategory
+exports.getBasketballLivePageData = exports.getLivePageData

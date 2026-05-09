@@ -758,6 +758,12 @@ exports.getVideos = async (req, res) => {
 exports.getHome = async (req, res) => {
   try {
     const homeSeed = buildHomeSeed()
+    const cacheKey = `home_v6_${homeSeed}`
+    const cached = await getCache(cacheKey)
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+      return res.json({ code: 200, data: cached, cached: true })
+    }
     const fixId = (queryResult) =>
       queryResult.map((item) => {
         const doc = item._doc || item
@@ -866,13 +872,13 @@ exports.getHome = async (req, res) => {
       { title: "高分口碑电影", type: "scroll", data: fixId(highMoviePicked) },
     ].filter((section) => section.data.length > 0)
 
-    res.json({
-      code: 200,
-      data: {
-        banners: fixId(banners),
-        sections,
-      },
-    })
+    const payload = {
+      banners: fixId(banners),
+      sections,
+    }
+    await setCache(cacheKey, payload, 300)
+    res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300")
+    res.json({ code: 200, data: payload })
   } catch (e) {
     res.status(500).json({ code: 500, msg: e.message })
   }

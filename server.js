@@ -74,35 +74,35 @@ app.use((req, res, next) => {
 })
 app.use(
   cors({
-    // origin: process.env.NODE_ENV === "production" ? "*" : "*",
-    // optionsSuccessStatus: 200,
-    origin: [
-      // 1. 你的线上前端域名 (如果有的话，比如 Vercel 的地址)
-      "https://www.bycurry.cc",
-      "https://bycurry.cc",
-      "https://global-vision-web.vercel.app", // 举例
-
-      // 2. Android App 必备 (Capacitor)
-      "https://localhost",
-      "http://localhost",
-      // 3. iOS App 必备 (Capacitor)
-      "capacitor://localhost",
-      "http://172.19.203.212:3000",
-      "http://172.19.203.212:5173",
-      "http://172.19.203.212:5174",
-
-      // 4. 本地开发调试
-      "http://localhost:5173",
-      "http://localhost:5174",
-      "http://localhost:5175",
-      "http://localhost:5176",
-      "http://localhost:5177",
-      "http://localhost:3000",
-
-      // 5. 允许所有 IP (如果你想允许局域网调试)
-      // 注意：这只是一个正则示例，生产环境建议去掉下面这行
-      // /^http:\/\/192\.168\.\d{1,3}\.\d{1,3}:\d{4}$/
-    ],
+    origin(origin, callback) {
+      if (!origin) return callback(null, true)
+      const allowList = new Set([
+        "https://www.bycurry.cc",
+        "https://bycurry.cc",
+        "https://global-vision-web.vercel.app",
+        "https://localhost",
+        "http://localhost",
+        "capacitor://localhost",
+      ])
+      if (allowList.has(origin)) return callback(null, true)
+      try {
+        const parsed = new URL(origin)
+        const isLocalHost =
+          parsed.hostname === "localhost" ||
+          parsed.hostname === "127.0.0.1" ||
+          parsed.hostname === "::1"
+        const isPrivateLan =
+          /^192\.168\.\d{1,3}\.\d{1,3}$/.test(parsed.hostname) ||
+          /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(parsed.hostname) ||
+          /^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(
+            parsed.hostname,
+          )
+        if ((isLocalHost || isPrivateLan) && /^5\d{3}$|^3000$/.test(parsed.port)) {
+          return callback(null, true)
+        }
+      } catch (e) {}
+      return callback(new Error(`CORS blocked origin: ${origin}`))
+    },
     credentials: true, // 允许携带 Cookie 或认证头
     optionsSuccessStatus: 200,
   }),
